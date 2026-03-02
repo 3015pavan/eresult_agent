@@ -1,0 +1,198 @@
+# System configuration
+system:
+  name: "AcadExtract"
+  version: "1.0.0"
+  environment: "production"  # development, staging, production
+  log_level: "INFO"
+  timezone: "Asia/Kolkata"
+
+# Email ingestion settings
+email:
+  poll_interval_seconds: 60
+  max_attachment_size_mb: 50
+  dedup_simhash_threshold: 0.92
+  classification_confidence_threshold: 0.85
+  classification_review_threshold: 0.60
+  max_retries: 3
+  backoff_base_seconds: 2
+  backoff_max_seconds: 60
+  batch_size: 50
+  accounts: []  # populated from secrets
+
+# Document parsing settings
+document:
+  ocr_confidence_threshold: 0.7
+  table_detection_confidence: 0.5
+  max_pages_per_document: 200
+  image_dpi: 300
+  deskew_angle_threshold_degrees: 0.5
+  camelot_flavor_order:
+    - lattice
+    - stream
+  ocr_engines:
+    primary: paddleocr
+    fallback: tesseract
+  vlm_model: donut  # fallback when OCR fails
+
+# Information extraction settings
+extraction:
+  llm_temperature: 0
+  llm_max_tokens: 4096
+  max_validation_retries: 3
+  gpa_max: 10.0
+  marks_max_default: 100
+  usn_pattern: '[1-4][A-Z]{2}\d{2}[A-Z]{2,3}\d{3}'
+  name_similarity_threshold: 0.92
+  confidence_threshold_auto_accept: 0.85
+  confidence_threshold_quarantine: 0.50
+  strategies:
+    priority_order:
+      - rule_based
+      - regex
+      - llm
+  voting:
+    all_agree_confidence: 0.98
+    majority_confidence: 0.85
+    conflict_resolution: rule_first  # rule_first, majority, highest_confidence
+
+# Agent orchestration settings
+agent:
+  max_steps: 20
+  tool_timeout_seconds: 30
+  circuit_breaker_threshold: 3
+  circuit_breaker_window_seconds: 60
+  memory_ttl_seconds: 3600
+  reflection_enabled: true
+  max_concurrent_agents: 4
+
+# Query engine settings
+query:
+  sql_statement_timeout_seconds: 10
+  max_results_per_query: 1000
+  rate_limit_per_user_per_minute: 100
+  rate_limit_per_institution_per_minute: 1000
+  allowed_tables:
+    - students
+    - student_results
+    - subjects
+    - semester_aggregates
+    - departments
+  forbidden_operations:
+    - DROP
+    - DELETE
+    - UPDATE
+    - INSERT
+    - ALTER
+    - TRUNCATE
+    - CREATE
+
+# Database configuration
+database:
+  host: ${DB_HOST:-localhost}
+  port: ${DB_PORT:-5432}
+  name: ${DB_NAME:-acadextract}
+  user: ${DB_USER:-acadextract}
+  password: ${DB_PASSWORD}
+  pool_size: 20
+  max_overflow: 10
+  pool_timeout: 30
+  pool_recycle: 3600
+
+# Redis configuration
+redis:
+  host: ${REDIS_HOST:-localhost}
+  port: ${REDIS_PORT:-6379}
+  password: ${REDIS_PASSWORD}
+  db: 0
+  max_connections: 50
+
+# Object storage (S3/MinIO)
+storage:
+  type: s3  # s3, minio, local
+  endpoint: ${S3_ENDPOINT}
+  access_key: ${S3_ACCESS_KEY}
+  secret_key: ${S3_SECRET_KEY}
+  region: ${S3_REGION:-ap-south-1}
+  buckets:
+    raw_emails: acadextract-raw-emails
+    attachments: acadextract-attachments
+    extraction_artifacts: acadextract-artifacts
+
+# LLM provider configuration
+llm:
+  primary:
+    provider: openai  # openai, azure_openai, gemini, local
+    model: gpt-4o
+    api_key: ${OPENAI_API_KEY}
+    max_tokens: 4096
+    temperature: 0
+    timeout: 30
+  secondary:
+    provider: gemini
+    model: gemini-1.5-pro
+    api_key: ${GEMINI_API_KEY}
+    max_tokens: 4096
+    temperature: 0
+    timeout: 30
+  local_fallback:
+    provider: local
+    model: mistral-7b-instruct
+    endpoint: http://localhost:8080/v1
+    max_tokens: 4096
+    temperature: 0
+  embedding:
+    provider: openai
+    model: text-embedding-3-small
+    api_key: ${OPENAI_API_KEY}
+    dimensions: 1536
+
+# Celery task queue
+celery:
+  broker_url: redis://${REDIS_HOST:-localhost}:${REDIS_PORT:-6379}/1
+  result_backend: redis://${REDIS_HOST:-localhost}:${REDIS_PORT:-6379}/2
+  task_queues:
+    - name: email.ingest
+      priority: 5
+    - name: email.classify
+      priority: 5
+    - name: email.extract_attachments
+      priority: 4
+    - name: document.parse
+      priority: 3
+    - name: extraction.extract
+      priority: 3
+    - name: extraction.validate
+      priority: 2
+    - name: profile.build
+      priority: 2
+    - name: agent.orchestrate
+      priority: 1
+  task_default_retry_delay: 60
+  task_max_retries: 3
+  worker_prefetch_multiplier: 1
+  task_acks_late: true
+
+# Monitoring
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  opentelemetry:
+    enabled: true
+    endpoint: ${OTEL_ENDPOINT:-http://localhost:4317}
+  sentry:
+    enabled: true
+    dsn: ${SENTRY_DSN}
+    traces_sample_rate: 0.1
+
+# Security
+security:
+  jwt_secret: ${JWT_SECRET}
+  jwt_expiry_minutes: 15
+  refresh_token_expiry_days: 7
+  bcrypt_rounds: 12
+  cors_origins:
+    - "https://*.acadextract.io"
+  rate_limit:
+    enabled: true
+    default_per_minute: 60
