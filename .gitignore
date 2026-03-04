@@ -1,2 +1,26 @@
+# ── Environment & secrets ───────────────────────────────
 .env
-credentials.json
+config/secrets/
+
+# ── Runtime data (generated, not source-controlled) ─────
+data/accounts.json
+data/emails_cache.json
+data/state/
+
+# ── Python ───────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Logs & temp ──────────────────────────────────────────
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

@@ -34,18 +34,24 @@
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span>Student Lookup</span>
       </a>
+      <a href="#" class="nav-item" data-page="accounts">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        <span>Email Accounts</span>
+        <span class="nav-badge" id="accounts-badge" style="display:none;">0</span>
+      </a>
       <a href="#" class="nav-item" data-page="admin">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
         <span>Admin Panel</span>
       </a>
+      <a href="#" class="nav-item" data-page="assistant">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/><circle cx="9" cy="10" r="1" fill="currentColor"/><circle cx="12" cy="10" r="1" fill="currentColor"/><circle cx="15" cy="10" r="1" fill="currentColor"/></svg>
+        <span>AI Assistant</span>
+      </a>
     </nav>
     <div class="sidebar-footer">
-      <div class="gmail-connect" id="gmail-connect">
-        <div class="gmail-status" id="gmail-status">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-          <span class="gmail-text">Checking Gmail...</span>
-        </div>
-        <button class="btn btn-gmail" id="gmail-btn" style="display:none;" onclick="App.connectGmail()">Connect Gmail</button>
+      <div class="accounts-summary" id="accounts-summary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        <span id="accounts-summary-text">No mail accounts</span>
       </div>
       <div class="health-badge" id="health-badge">
         <span class="health-dot"></span>
@@ -63,13 +69,10 @@
       </button>
       <h1 class="page-title" id="page-title">Dashboard</h1>
       <div class="topbar-right">
-        <div class="gmail-user" id="gmail-user" style="display:none;">
-          <img class="gmail-avatar" id="gmail-avatar" src="" alt="" />
-          <span class="gmail-email" id="gmail-email"></span>
-          <button class="btn btn-sm btn-disconnect" onclick="App.disconnectGmail()" title="Disconnect Gmail">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-          </button>
-        </div>
+        <button class="btn btn-sm btn-add-account" onclick="App.openAddAccountModal()" title="Add email account">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Account
+        </button>
         <span class="env-badge" id="env-badge">DEV</span>
       </div>
     </header>
@@ -123,13 +126,13 @@
           </div>
           <div class="card-body">
             <div class="pipeline-stats" id="pipeline-stats">
-              <div class="pipeline-row"><span>Emails Processed</span><span id="ps-emails">—</span></div>
-              <div class="pipeline-row"><span>Documents Parsed</span><span id="ps-docs">—</span></div>
-              <div class="pipeline-row"><span>Records Extracted</span><span id="ps-records">—</span></div>
-              <div class="pipeline-row"><span>Pending Emails</span><span id="ps-pending">—</span></div>
-              <div class="pipeline-row"><span>Failed Documents</span><span id="ps-failed">—</span></div>
-              <div class="pipeline-row"><span>Agent Runs</span><span id="ps-agent">—</span></div>
-              <div class="pipeline-row"><span>Avg Processing Time</span><span id="ps-avgtime">—</span></div>
+              <div class="pipeline-row"><span>Emails in Database</span><span id="ps-emails">—</span></div>
+              <div class="pipeline-row"><span>Students Tracked</span><span id="ps-students">—</span></div>
+              <div class="pipeline-row"><span>Result Records</span><span id="ps-records">—</span></div>
+              <div class="pipeline-row"><span>Average CGPA</span><span id="ps-avgcgpa">—</span></div>
+              <div class="pipeline-row"><span>Backlogs Detected</span><span id="ps-backlogs">—</span></div>
+              <div class="pipeline-row"><span>Last Run Status</span><span id="ps-agent">—</span></div>
+              <div class="pipeline-row"><span>Last Run At</span><span id="ps-avgtime">—</span></div>
             </div>
           </div>
         </div>
@@ -157,6 +160,77 @@
           <div class="stat-info-row">
             <span>Total Extractions:</span><span id="stat-extractions" class="stat-highlight">—</span>
           </div>
+        </div>
+      </div>
+
+      <!-- ── Inbox ───────────────────────────────────────── -->
+      <div class="card" id="inbox-card">
+        <div class="card-header">
+          <h3>Inbox <span id="inbox-count" class="inbox-count"></span></h3>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="text" id="inbox-search" class="input" style="width:180px;height:30px;font-size:12px;" placeholder="Search emails…" oninput="App.filterInbox()" />
+            <button class="btn btn-primary btn-sm" id="sync-btn" onclick="App.syncEmails()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+              Sync
+            </button>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0">
+          <div id="sync-status-bar" class="sync-status-bar" style="display:none;"></div>
+          <div id="inbox-list" class="inbox-list">
+            <p class="muted" style="padding:20px 24px;">Connect your email and click <strong>Sync</strong> to fetch emails.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Pipeline Control ───────────────────────────── -->
+      <div class="card" id="pipeline-card">
+        <div class="card-header">
+          <h3>Pipeline Control</h3>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button class="btn btn-primary btn-sm" id="run-pipeline-btn" onclick="App.runPipeline(false)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Run Pipeline
+            </button>
+            <button class="btn btn-sm" id="force-pipeline-btn" onclick="App.runPipeline(true)" title="Force reprocess all emails from scratch" style="border:1px solid var(--accent-orange,#f59e0b);color:var(--accent-orange,#f59e0b);background:transparent;">
+              ↺ Force Reprocess
+            </button>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0">
+          <div style="padding:10px 20px 4px;font-size:12px;color:var(--text-muted);">
+            Processes synced emails through all 5 phases:
+            <strong>Classify</strong> → <strong>Parse</strong> → <strong>Extract</strong> → <strong>Agent</strong> → <strong>Store</strong>
+          </div>
+
+          <!-- Email counts summary strip -->
+          <div id="pipeline-email-summary" style="display:flex;gap:0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin:8px 0 0;">
+            <div class="pe-stat" style="flex:1;padding:10px 16px;text-align:center;border-right:1px solid var(--border);">
+              <div class="pe-val" id="pes-synced" style="font-size:22px;font-weight:700;color:var(--accent);">—</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">emails synced</div>
+            </div>
+            <div class="pe-stat" style="flex:1;padding:10px 16px;text-align:center;border-right:1px solid var(--border);">
+              <div class="pe-val" id="pes-result" style="font-size:22px;font-weight:700;color:var(--green);">—</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">result emails</div>
+            </div>
+            <div class="pe-stat" style="flex:1;padding:10px 16px;text-align:center;border-right:1px solid var(--border);">
+              <div class="pe-val" id="pes-records" style="font-size:22px;font-weight:700;color:var(--purple);">—</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">records saved</div>
+            </div>
+            <div class="pe-stat" style="flex:1;padding:10px 16px;text-align:center;">
+              <div class="pe-val" id="pes-students" style="font-size:22px;font-weight:700;color:var(--orange);">—</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">students</div>
+            </div>
+          </div>
+
+          <!-- Last sync info -->
+          <div id="pipeline-sync-info" style="padding:6px 20px;font-size:11.5px;color:var(--text-muted);display:flex;gap:16px;align-items:center;">
+            <span id="psi-account" style="font-weight:500;color:var(--text-dim);"></span>
+            <span id="psi-last-sync"></span>
+            <span id="psi-new-fetched" style="color:var(--accent);"></span>
+          </div>
+
+          <pre id="pipeline-log" style="display:none;margin:0 20px 16px;padding:12px;background:var(--bg-tertiary,#1a1d27);border-radius:8px;font-size:11.5px;color:#c5c8d8;max-height:220px;overflow:auto;white-space:pre-wrap;"></pre>
         </div>
       </div>
     </section>
@@ -219,13 +293,13 @@
           <h3>Student Lookup</h3>
         </div>
         <div class="card-body">
-          <p class="hint">Enter a USN to view the student's academic profile and SGPA trend.</p>
+          <p class="hint">Enter a USN to view full academic profile, all semester results, and download report.</p>
           <div class="query-input-group">
             <input
               type="text"
               id="student-usn-input"
               class="input-lg"
-              placeholder="e.g., 1BM21CS001"
+              placeholder="e.g., 1MS21CS001"
               autocomplete="off"
             />
             <button class="btn btn-primary btn-lg" id="student-submit" onclick="App.lookupStudent()">
@@ -239,14 +313,29 @@
       <div id="student-result" style="display:none;">
         <div class="student-profile-grid">
           <div class="card student-info-card">
-            <div class="card-header"><h3>Student Profile</h3></div>
+            <div class="card-header">
+              <h3>Student Profile</h3>
+              <div style="display:flex;gap:8px;">
+                <button class="btn btn-sm btn-primary" onclick="App.downloadReport('pdf')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+                  PDF
+                </button>
+                <button class="btn btn-sm" onclick="App.downloadReport('docx')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  DOCX
+                </button>
+              </div>
+            </div>
             <div class="card-body">
               <div class="profile-field"><span class="profile-label">USN</span><span class="profile-value" id="sp-usn">—</span></div>
               <div class="profile-field"><span class="profile-label">Name</span><span class="profile-value" id="sp-name">—</span></div>
+              <div class="profile-field"><span class="profile-label">Email</span><span class="profile-value" id="sp-email">—</span></div>
               <div class="profile-field"><span class="profile-label">Department</span><span class="profile-value" id="sp-dept">—</span></div>
               <div class="profile-field"><span class="profile-label">Batch Year</span><span class="profile-value" id="sp-batch">—</span></div>
-              <div class="profile-field"><span class="profile-label">Current CGPA</span><span class="profile-value cgpa-value" id="sp-cgpa">—</span></div>
+              <div class="profile-field"><span class="profile-label">CGPA</span><span class="profile-value cgpa-value" id="sp-cgpa">—</span></div>
               <div class="profile-field"><span class="profile-label">Active Backlogs</span><span class="profile-value" id="sp-backlogs">—</span></div>
+              <div class="profile-field"><span class="profile-label">Class Rank</span><span class="profile-value" id="sp-rank">—</span></div>
+              <div class="profile-field"><span class="profile-label">Total Results</span><span class="profile-value" id="sp-total-results">—</span></div>
             </div>
           </div>
           <div class="card">
@@ -259,18 +348,14 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-header"><h3>Semester Details</h3></div>
+          <div class="card-header"><h3>Semester Summary</h3></div>
           <div class="card-body">
             <div class="data-table-wrap">
               <table class="data-table" id="semester-table">
                 <thead>
                   <tr>
-                    <th>Semester</th>
-                    <th>SGPA</th>
-                    <th>Credits Earned</th>
-                    <th>Credits Attempted</th>
-                    <th>Passed</th>
-                    <th>Failed</th>
+                    <th>Semester</th><th>SGPA</th><th>Credits Earned</th>
+                    <th>Credits Attempted</th><th>Passed</th><th>Failed</th>
                   </tr>
                 </thead>
                 <tbody id="semester-tbody"></tbody>
@@ -278,11 +363,82 @@
             </div>
           </div>
         </div>
+        <!-- Detailed subject results injected here by JS -->
+        <div id="subject-results-container"></div>
       </div>
     </section>
+    <!-- ── Email Accounts Page ─────────────────────────────── -->
+    <section class="page" id="page-accounts">
+      <div class="card">
+        <div class="card-header">
+          <h3>Email Accounts</h3>
+          <button class="btn btn-primary btn-sm" onclick="App.openAddAccountModal()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Account
+          </button>
+        </div>
+        <div class="card-body">
+          <p class="hint">Connect Gmail, college IMAP servers, Microsoft 365 / Exchange Online, or webhook relay services.</p>
+          <div id="accounts-list" class="accounts-list">
+            <p class="muted" id="accounts-empty">No accounts configured yet. Click <strong>Add Account</strong> to connect your first mailbox.</p>
+          </div>
+        </div>
+      </div>
 
+      <div class="card">
+        <div class="card-header"><h3>Provider Guide</h3></div>
+        <div class="card-body provider-guide">
+          <div class="provider-guide-item">
+            <span class="provider-chip gmail">Gmail</span>
+            <span>Google Workspace EDU, personal Gmail — OAuth2 via Connect Gmail button</span>
+          </div>
+          <div class="provider-guide-item">
+            <span class="provider-chip imap">IMAP</span>
+            <span>Any college/university mail server (Zimbra, Dovecot, cPanel), Outlook IMAP, Yahoo IMAP — uses TLS port 993</span>
+          </div>
+          <div class="provider-guide-item">
+            <span class="provider-chip msgraph">Microsoft 365</span>
+            <span>University Microsoft 365 EDU, corporate Exchange Online — Azure AD app credentials</span>
+          </div>
+          <div class="provider-guide-item">
+            <span class="provider-chip webhook">Webhook</span>
+            <span>Mailgun Inbound Routes, SendGrid Inbound Parse, Postmark, custom MTA forward — POSTs raw MIME to /webhooks/email</span>
+          </div>
+        </div>
+      </div>
+    </section>
     <!-- ── Admin Page ───────────────────────────────────── -->
     <section class="page" id="page-admin">
+      <!-- Document Upload -->
+      <div class="card" style="margin-bottom:20px;">
+        <div class="card-header">
+          <h3>Upload Result Document</h3>
+          <span style="font-size:11px;color:var(--text-muted);">Excel · CSV · PDF · DOCX · TXT</span>
+        </div>
+        <div class="card-body">
+          <p class="hint">Upload marksheets or result files. Data is parsed and stored directly into the student database — immediately available in AI Assistant, Student Lookup, and Query Engine.</p>
+          <div id="upload-drop-zone" class="upload-drop-zone"
+               ondragover="event.preventDefault();this.classList.add('drag-over')"
+               ondragleave="this.classList.remove('drag-over')"
+               ondrop="App.handleFileDrop(event)">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <p style="margin:8px 0 4px;color:var(--text-muted);">Drag &amp; drop file here, or</p>
+            <label class="btn btn-primary btn-sm" style="cursor:pointer;">
+              Browse File
+              <input type="file" id="upload-file-input" accept=".xlsx,.xls,.csv,.pdf,.docx,.txt" style="display:none;" onchange="App.handleFileSelect(this)" />
+            </label>
+            <p id="upload-file-name" style="margin-top:8px;font-size:12px;color:var(--text-muted);"></p>
+          </div>
+          <div style="display:flex;gap:10px;margin-top:12px;">
+            <button class="btn btn-primary" id="upload-submit-btn" onclick="App.uploadDocument()" disabled>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload &amp; Process
+            </button>
+          </div>
+          <div class="result-box" id="upload-result" style="display:none;"></div>
+        </div>
+      </div>
+
       <div class="admin-grid">
         <div class="card">
           <div class="card-header"><h3>Trigger Email Ingestion</h3></div>
@@ -339,7 +495,177 @@
         </div>
       </div>
     </section>
+    <!-- ── AI Assistant Page ───────────────────────────── -->
+    <section class="page" id="page-assistant">
+      <div class="card chat-card">
+        <div class="card-header">
+          <div class="chat-header-left">
+            <div class="chat-avatar-icon">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+            </div>
+            <div>
+              <h3 style="margin:0">AcadAssist</h3>
+              <span class="chat-powered-by">Powered by Gemini 2.0 Flash</span>
+            </div>
+          </div>
+          <button class="btn btn-sm" onclick="App.clearChat()">Clear</button>
+        </div>
+        <div class="chat-messages" id="chat-messages">
+          <div class="chat-msg assistant">
+            <div class="chat-bubble">
+              Hello! I&apos;m AcadAssist. I have access to your student database and can answer questions like:<br><br>
+              &bull; <em>Show results for 1BM21CS001</em><br>
+              &bull; <em>Which students have more than 2 backlogs?</em><br>
+              &bull; <em>What is the average CGPA of the class?</em><br>
+              &bull; <em>Which subject has the lowest pass rate?</em><br><br>
+              How can I help you today?
+            </div>
+          </div>
+        </div>
+        <div class="chat-input-area">
+          <textarea
+            id="chat-input"
+            class="chat-textarea"
+            placeholder="Ask anything about student results…"
+            rows="1"
+            onkeydown="App.chatKeyDown(event)"
+            oninput="App.chatAutoResize(this)"
+          ></textarea>
+          <button class="btn btn-primary chat-send-btn" id="chat-send-btn" onclick="App.sendChatMessage()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+    </section>
+
   </main>
+
+  <!-- Add Account Modal -->
+  <div class="ea-overlay" id="add-account-modal" style="display:none;" onclick="App.closeAddAccountModal(event)">
+    <div class="ea-modal" onclick="event.stopPropagation()">
+
+      <button class="ea-close" onclick="App.closeAddAccountModal()" title="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+
+      <!-- ── STEP 1 : Email address ──────────────────────────────── -->
+      <div id="ea-step1" class="ea-step">
+        <div class="ea-brand">
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+            <polyline points="22,6 12,13 2,6"/>
+          </svg>
+        </div>
+        <h2 class="ea-title">Add email account</h2>
+        <p class="ea-sub">Works with Gmail, Outlook, college &amp; work email</p>
+
+        <input type="email" id="acc-email" class="ea-input" placeholder="your@email.com"
+               autocomplete="email" autocapitalize="off" spellcheck="false"
+               onkeydown="if(event.key==='Enter')App.emailContinue()"
+               oninput="App.onEmailType(this.value)" />
+
+        <button class="ea-btn-primary" id="ea-continue-btn" onclick="App.emailContinue()" disabled>
+          Continue
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </button>
+      </div>
+
+      <!-- ── STEP 2 : Provider-aware auth ─────────────────────── -->
+      <div id="ea-step2" class="ea-step" style="display:none;">
+        <button class="ea-back" onclick="App._goStep1()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          Back
+        </button>
+
+        <!-- Detected email pill -->
+        <div class="ea-detected" id="ea-detected">
+          <span id="ea-detected-icon"></span>
+          <span id="ea-detected-email" class="ea-detected-email"></span>
+          <span id="ea-detected-badge"></span>
+        </div>
+
+        <!-- Google / Google Workspace → OAuth button (primary) -->
+        <div id="ea-oauth-google" style="display:none;">
+          <button class="ea-big-oauth ea-big-google" onclick="App.connectGmail()">
+            <svg width="20" height="20" viewBox="0 0 48 48">
+              <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.2l6.8-6.8C35.8 2.2 30.2 0 24 0 14.7 0 6.7 5.4 2.9 13.3l7.9 6.1C12.6 13.4 17.9 9.5 24 9.5z"/>
+              <path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8c4.4-4.1 7.1-10.1 7.1-17z"/>
+              <path fill="#FBBC05" d="M10.8 28.6A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.2.8-4.6L2.4 13.3A24 24 0 0 0 0 24c0 3.9.9 7.5 2.5 10.8l8.3-6.2z"/>
+              <path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.5-5.8c-2.1 1.4-4.8 2.2-8.4 2.2-6.1 0-11.4-3.9-13.2-9.4l-7.9 6.1C6.7 42.6 14.7 48 24 48z"/>
+            </svg>
+            Continue with Google
+          </button>
+          <button class="ea-alt-link" onclick="App.showImapForm()">Use App Password (IMAP) instead</button>
+        </div>
+
+        <!-- IMAP password form (non-Google, or when user picks App Password) -->
+        <div id="ea-imap-form" style="display:none;">
+          <div class="ea-server-row" id="ea-server-row">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            <span id="ea-server-text"></span>
+            <button class="ea-link" onclick="App.toggleAdvanced()">Edit</button>
+          </div>
+
+          <div id="ea-gmail-warn" class="ea-warn" style="display:none;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <span>Requires an <strong>App Password</strong> — not your regular password.
+            <a href="https://myaccount.google.com/apppasswords" target="_blank">Create one ↗</a></span>
+          </div>
+
+          <input type="password" id="acc-password" class="ea-input" placeholder="Password"
+                 autocomplete="current-password"
+                 onkeydown="if(event.key==='Enter')App.submitAddAccount()" />
+
+          <div id="acc-advanced" style="display:none;">
+            <div class="ea-adv-label">Server settings</div>
+            <div class="ea-adv-row">
+              <input type="text"   id="imap-host"    class="ea-input ea-adv-host" placeholder="imap.college.edu" />
+              <input type="number" id="imap-port"    class="ea-input ea-adv-port" value="993" />
+              <input type="text"   id="imap-mailbox" class="ea-input ea-adv-mbox" value="INBOX" />
+              <label class="ea-ssl-label"><input type="checkbox" id="imap-ssl" checked /> SSL</label>
+            </div>
+          </div>
+
+          <div id="ea-result" class="conn-test-result" style="display:none;"></div>
+
+          <button class="ea-btn-primary" id="ea-connect-btn" onclick="App.submitAddAccount()">
+            Connect
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- ── STEP 3 : Microsoft 365 API creds ─────────────────── -->
+      <div id="ea-step3" class="ea-step" style="display:none;">
+        <button class="ea-back" onclick="App._goStep1()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          Back
+        </button>
+
+        <div class="ea-ms-header">
+          <svg width="32" height="32" viewBox="0 0 23 23" fill="none"><rect x="1" y="1" width="10" height="10" fill="#f25022"/><rect x="12" y="1" width="10" height="10" fill="#7fba00"/><rect x="1" y="12" width="10" height="10" fill="#00a4ef"/><rect x="12" y="12" width="10" height="10" fill="#ffb900"/></svg>
+          <div>
+            <div class="ea-ms-title">Microsoft 365</div>
+            <div class="ea-ms-sub">University / corporate Exchange Online</div>
+          </div>
+        </div>
+
+        <input type="email"    id="mg-user-email"    class="ea-input" placeholder="you@university.edu" />
+        <input type="text"     id="mg-tenant-id"     class="ea-input" placeholder="Tenant ID" />
+        <input type="text"     id="mg-client-id"     class="ea-input" placeholder="App (Client) ID" />
+        <input type="password" id="mg-client-secret" class="ea-input" placeholder="Client Secret" />
+        <p class="ea-hint">Azure AD app needs <code>Mail.Read</code> (Application) permission</p>
+
+        <div id="ea-result-mg" class="conn-test-result" style="display:none;"></div>
+
+        <button class="ea-btn-primary" id="mg-connect-btn" onclick="App.submitMsgraph()">
+          Connect
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </button>
+      </div>
+
+    </div>
+  </div>
 
   <!-- Toast container -->
   <div class="toast-container" id="toast-container"></div>

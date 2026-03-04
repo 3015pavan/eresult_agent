@@ -1,8 +1,8 @@
 """
 Structured logging and observability infrastructure.
 
-Uses structlog for structured JSON logging and OpenTelemetry for distributed tracing.
-All pipeline stages emit structured events for complete audit trails.
+Structured JSON logging via structlog.
+Prometheus metrics for query engine and pipeline.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import time
 from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Generator
-from uuid import UUID
 
 import structlog
 from prometheus_client import Counter, Histogram, Gauge
@@ -45,109 +44,32 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
 # PROMETHEUS METRICS
 # =============================================================================
 
-# Phase 1 — Email Intelligence
+# Pipeline
 EMAILS_INGESTED = Counter(
     "acadextract_emails_ingested_total",
     "Total emails ingested",
-    ["account_id", "institution_id"],
-)
-EMAILS_CLASSIFIED = Counter(
-    "acadextract_emails_classified_total",
-    "Total emails classified",
-    ["classification", "institution_id"],
-)
-EMAIL_CLASSIFICATION_CONFIDENCE = Histogram(
-    "acadextract_email_classification_confidence",
-    "Distribution of email classification confidence scores",
-    buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
+    ["classification"],
 )
 EMAILS_DEDUPLICATED = Counter(
     "acadextract_emails_deduplicated_total",
-    "Total duplicate emails detected and skipped",
-    ["dedup_method"],  # exact_hash, simhash, attachment_hash
+    "Total duplicate emails skipped",
+    ["dedup_method"],
 )
-EMAIL_INGESTION_LATENCY = Histogram(
-    "acadextract_email_ingestion_latency_seconds",
-    "Email ingestion latency",
-)
-
-# Phase 2 — Document Intelligence
-DOCUMENTS_PARSED = Counter(
-    "acadextract_documents_parsed_total",
-    "Total documents parsed",
-    ["document_type", "parse_method"],
-)
-DOCUMENT_PARSE_LATENCY = Histogram(
-    "acadextract_document_parse_latency_seconds",
-    "Document parsing latency",
-    ["document_type"],
-)
-OCR_CONFIDENCE = Histogram(
-    "acadextract_ocr_confidence",
-    "OCR confidence scores",
-    buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
-)
-TABLES_EXTRACTED = Counter(
-    "acadextract_tables_extracted_total",
-    "Total tables extracted from documents",
-)
-
-# Phase 3 — Information Extraction
 RECORDS_EXTRACTED = Counter(
     "acadextract_records_extracted_total",
     "Total student records extracted",
     ["strategy"],
 )
-EXTRACTION_CONFIDENCE = Histogram(
-    "acadextract_extraction_confidence",
-    "Extraction confidence scores",
-    buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
-)
-VALIDATION_FAILURES = Counter(
-    "acadextract_validation_failures_total",
-    "Extraction validation failures by type",
-    ["failure_type"],
-)
-RECORDS_QUARANTINED = Counter(
-    "acadextract_records_quarantined_total",
-    "Records quarantined for human review",
-)
-LLM_TOKENS_USED = Counter(
-    "acadextract_llm_tokens_used_total",
-    "Total LLM tokens consumed",
-    ["provider", "model", "phase"],
+PIPELINE_ERRORS = Counter(
+    "acadextract_pipeline_errors_total",
+    "Total pipeline errors",
+    ["phase", "error_type"],
 )
 
-# Phase 4 — Agent
-AGENT_RUNS = Counter(
-    "acadextract_agent_runs_total",
-    "Total agent execution runs",
-    ["final_state"],
-)
-AGENT_STEPS = Counter(
-    "acadextract_agent_steps_total",
-    "Total agent steps by type",
-    ["step_type"],
-)
-AGENT_TOOL_CALLS = Counter(
-    "acadextract_agent_tool_calls_total",
-    "Agent tool invocations",
-    ["tool_name", "success"],
-)
-AGENT_ACTIVE = Gauge(
-    "acadextract_agent_active",
-    "Currently active agent runs",
-)
-
-# Phase 5 — Query Engine
+# Query Engine
 QUERIES_PROCESSED = Counter(
     "acadextract_queries_processed_total",
     "Total teacher queries processed",
-    ["intent"],
-)
-QUERY_LATENCY = Histogram(
-    "acadextract_query_latency_seconds",
-    "Query processing latency",
     ["intent"],
 )
 QUERY_DURATION = Histogram(
@@ -156,19 +78,7 @@ QUERY_DURATION = Histogram(
     ["intent"],
 )
 
-# Phase 3 — Extraction (additional)
-EXTRACTION_DURATION = Histogram(
-    "acadextract_extraction_duration_seconds",
-    "Extraction processing duration",
-    ["strategy"],
-)
-
-# System-level
-PIPELINE_ERRORS = Counter(
-    "acadextract_pipeline_errors_total",
-    "Total pipeline errors",
-    ["phase", "error_type"],
-)
+# System
 ACTIVE_WORKERS = Gauge(
     "acadextract_active_workers",
     "Currently active worker count",
@@ -196,52 +106,34 @@ def timed(metric: Histogram | None = None):
     def decorator(func):
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
-            logger = get_logger(func.__module__)
+            log = get_logger(func.__module__)
             start = time.perf_counter()
             try:
                 result = await func(*args, **kwargs)
                 elapsed = (time.perf_counter() - start) * 1000
-                logger.info(
-                    "function_completed",
-                    function=func.__name__,
-                    elapsed_ms=round(elapsed, 2),
-                )
+                log.info("function_completed", function=func.__name__, elapsed_ms=round(elapsed, 2))
                 if metric:
                     metric.observe(elapsed / 1000)
                 return result
             except Exception as e:
                 elapsed = (time.perf_counter() - start) * 1000
-                logger.error(
-                    "function_failed",
-                    function=func.__name__,
-                    elapsed_ms=round(elapsed, 2),
-                    error=str(e),
-                )
+                log.error("function_failed", function=func.__name__, elapsed_ms=round(elapsed, 2), error=str(e))
                 raise
 
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
-            logger = get_logger(func.__module__)
+            log = get_logger(func.__module__)
             start = time.perf_counter()
             try:
                 result = func(*args, **kwargs)
                 elapsed = (time.perf_counter() - start) * 1000
-                logger.info(
-                    "function_completed",
-                    function=func.__name__,
-                    elapsed_ms=round(elapsed, 2),
-                )
+                log.info("function_completed", function=func.__name__, elapsed_ms=round(elapsed, 2))
                 if metric:
                     metric.observe(elapsed / 1000)
                 return result
             except Exception as e:
                 elapsed = (time.perf_counter() - start) * 1000
-                logger.error(
-                    "function_failed",
-                    function=func.__name__,
-                    elapsed_ms=round(elapsed, 2),
-                    error=str(e),
-                )
+                log.error("function_failed", function=func.__name__, elapsed_ms=round(elapsed, 2), error=str(e))
                 raise
 
         import asyncio
@@ -249,3 +141,88 @@ def timed(metric: Histogram | None = None):
             return async_wrapper
         return sync_wrapper
     return decorator
+
+
+# =============================================================================
+# OPENTELEMETRY DISTRIBUTED TRACING
+# =============================================================================
+
+import os as _os
+import logging as _logging
+
+_otel_log = _logging.getLogger(__name__)
+_OTEL_ENDPOINT = _os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+_SERVICE_NAME  = _os.getenv("OTEL_SERVICE_NAME", "acadextract")
+
+# Try to initialise the OTel SDK; degrade gracefully when not installed.
+try:
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor as _BatchSpanProcessor
+    from opentelemetry.sdk.resources import Resource as _Resource
+
+    _resource = _Resource.create({"service.name": _SERVICE_NAME})
+    _provider = _TracerProvider(resource=_resource)
+
+    if _OTEL_ENDPOINT:
+        try:
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                OTLPSpanExporter as _OTLPExporter,
+            )
+            _exporter = _OTLPExporter(endpoint=_OTEL_ENDPOINT)
+            _provider.add_span_processor(_BatchSpanProcessor(_exporter))
+            _otel_log.info("OpenTelemetry OTLP exporter configured: %s", _OTEL_ENDPOINT)
+        except Exception as _exc:
+            _otel_log.warning("OTLP exporter init failed: %s — traces will not be exported", _exc)
+
+    _otel_trace.set_tracer_provider(_provider)
+    _tracer = _otel_trace.get_tracer(_SERVICE_NAME)
+    _OTEL_AVAILABLE = True
+
+except ImportError:
+    _OTEL_AVAILABLE = False
+    _otel_log.info("opentelemetry-sdk not installed — distributed tracing disabled")
+
+    class _NullSpan:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def set_attribute(self, *_): pass
+        def record_exception(self, *_): pass
+
+    class _NullTracer:
+        def start_as_current_span(self, name, **_):
+            return _NullSpan()
+
+    _tracer = _NullTracer()
+
+
+def get_tracer():
+    """Return the configured OTel tracer (or a null tracer when SDK is absent)."""
+    return _tracer
+
+
+def instrument_fastapi(app) -> None:
+    """
+    Auto-instrument a FastAPI app with OpenTelemetry.
+    Call this once after `create_app()` when the SDK is available.
+    """
+    if not _OTEL_AVAILABLE:
+        return
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
+        _otel_log.info("FastAPI OTel instrumentation enabled")
+    except Exception as exc:
+        _otel_log.warning("FastAPI OTel instrumentation failed: %s", exc)
+
+
+def instrument_psycopg2() -> None:
+    """Auto-instrument psycopg2 DB calls with OTel spans."""
+    if not _OTEL_AVAILABLE:
+        return
+    try:
+        from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+        Psycopg2Instrumentor().instrument()
+        _otel_log.info("psycopg2 OTel instrumentation enabled")
+    except Exception as exc:
+        _otel_log.warning("psycopg2 OTel instrumentation failed: %s", exc)

@@ -1,207 +1,181 @@
 """
-Planner Module.
+Planner — Phase 4.
 
-The Planner is the first component of the Planner-Executor-Critic loop.
-It takes the current state and produces a plan of tool calls to execute.
-
-Uses GPT-4o with function-calling to generate structured plans.
-Includes context from:
-  - Current working memory
-  - Recent agent steps
-  - Tool specifications
-  - Past successful traces (few-shot)
+Converts a high-level goal into a sequence of tool calls.
+Uses LLM for dynamic planning or rule-based templates for known goals.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any
+import logging
+import os
+import re
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+logger = logging.getLogger(__name__)
 
-from src.common.config import get_settings
-from src.common.models import ToolCall, AgentState
-from src.common.observability import get_logger
-from src.phase4_agentic_layer.tools import ToolRegistry
-from src.phase4_agentic_layer.memory import AgentMemory
+_GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 
-logger = get_logger(__name__)
+# ── Rule-based plan templates ─────────────────────────────────────────────────
+
+_TEMPLATES: dict[str, list[dict]] = {
+    "process_emails": [
+        {"tool": "email_fetch",     "args": {"query": "result OR marks OR grade", "max_results": 100}},
+        {"tool": "dedup_check",     "args": {"message_id": "{step_0.emails[0].id}"}},
+        {"tool": "classify_email",  "args": {"text": "{step_0.emails[0].body}"}},
+        {"tool": "extract_records", "args": {"text": "{step_0.emails[0].body}", "use_llm": True}},
+        {"tool": "validate",        "args": {"records": "{step_3.records}"}},
+        {"tool": "save_results",    "args": {"records": "{step_4.records}"}},
+    ],
+    "lookup_student": [
+        {"tool": "student_lookup",  "args": {"usn": "{usn}"}},
+        {"tool": "gpa_compute",     "args": {"usn": "{usn}"}},
+    ],
+    "find_backlogs": [
+        {"tool": "query_db", "args": {"sql": "SELECT usn, name, total_backlogs FROM students WHERE total_backlogs > 0 ORDER BY total_backlogs DESC LIMIT 20"}},
+    ],
+    "semantic_search": [
+        {"tool": "semantic_search", "args": {"query": "{query}", "limit": 10}},
+    ],
+    "parse_attachment": [
+        {"tool": "parse_document",  "args": {"path": "{path}", "mime_type": ""}},
+        {"tool": "extract_records", "args": {"text": "{step_0.text}", "use_llm": True}},
+        {"tool": "validate",        "args": {"records": "{step_1.records}"}},
+        {"tool": "save_results",    "args": {"records": "{step_2.records}"}},
+    ],
+    "ocr_image": [
+        {"tool": "ocr_image",       "args": {"path": "{path}"}},
+        {"tool": "extract_records", "args": {"text": "{step_0.text}", "use_llm": True}},
+        {"tool": "validate",        "args": {"records": "{step_1.records}"}},
+        {"tool": "save_results",    "args": {"records": "{step_2.records}"}},
+    ],
+    "parse_html_body": [
+        {"tool": "html_to_text",    "args": {"html": "{html}"}},
+        {"tool": "extract_records", "args": {"text": "{step_0.text}", "use_llm": True}},
+        {"tool": "validate",        "args": {"records": "{step_1.records}"}},
+        {"tool": "save_results",    "args": {"records": "{step_2.records}"}},
+    ],
+}
 
 
-PLANNER_SYSTEM_PROMPT = """You are the planning component of an autonomous academic result extraction system.
+def _match_template(goal: str, context: dict) -> list[dict] | None:
+    """Try to match the goal to a known template."""
+    gl = goal.lower()
 
-Your job: Given the current state and available tools, produce a PLAN — an ordered list of tool calls to execute next.
+    if any(w in gl for w in ("process", "email", "extract result", "run pipeline")):
+        plan = _TEMPLATES["process_emails"].copy()
+        return plan
 
-Context:
-- You process academic result emails with PDF/Excel/image attachments
-- The pipeline: Fetch emails → Classify → Dedup → Parse documents → Extract records → Validate → Store
-- Each tool call should advance the pipeline toward completion
+    usn_m = re.search(r"\b([1-4][a-z]{2}\d{2}[a-z]{2,3}\d{3})\b", gl, re.IGNORECASE)
+    if usn_m and any(w in gl for w in ("lookup", "find", "show", "get", "result", "grade")):
+        usn = usn_m.group(1).upper()
+        return [{"tool": t["tool"], "args": {k: v.replace("{usn}", usn) for k, v in t["args"].items()}}
+                for t in _TEMPLATES["lookup_student"]]
 
-Rules:
-1. Output a JSON array of tool calls, each with "tool", "arguments", and "reasoning"
-2. Plan 1-5 tool calls at a time (not the entire pipeline)
-3. Consider dependencies: some tools need outputs from previous tools
-4. If validation fails, plan correction steps
-5. If all emails are processed, plan a completion step
-6. Consider cost: use cheaper tools first, LLM tools only when needed
+    if any(w in gl for w in ("backlog", "fail", "arrear")):
+        return _TEMPLATES["find_backlogs"]
 
-Current state will be provided in the user message."""
+    if any(w in gl for w in ("search", "similar", "semantic")):
+        query = context.get("query", goal)
+        return [{"tool": "semantic_search", "args": {"query": query, "limit": 10}}]
+
+    # ── Image / OCR ───────────────────────────────────────────────────────────
+    if any(w in gl for w in ("ocr", "image", "photo", "scan", "jpg", "jpeg", "png")):
+        path = context.get("path", "")
+        url  = context.get("url", "")
+        if path or url:
+            tmpl = _TEMPLATES["ocr_image"]
+            return [{"tool": t["tool"],
+                     "args": {k: v.replace("{path}", path) for k, v in t["args"].items()}}
+                    for t in tmpl]
+
+    # ── HTML body ─────────────────────────────────────────────────────────────
+    if "html" in gl:
+        html = context.get("html", "")
+        if html:
+            tmpl = _TEMPLATES["parse_html_body"]
+            return [{"tool": t["tool"],
+                     "args": {k: v.replace("{html}", html) for k, v in t["args"].items()}}
+                    for t in tmpl]
+
+    # ── Generic document / attachment ─────────────────────────────────────────
+    if any(w in gl for w in ("pdf", "docx", "doc", "spreadsheet", "excel", "odt",
+                              "attachment", "document", "parse", "convert")):
+        path = context.get("path", "")
+        url  = context.get("url", "")
+        if path or url:
+            tmpl = _TEMPLATES["parse_attachment"]
+            return [{"tool": t["tool"],
+                     "args": {k: v.replace("{path}", path).replace("{url}", url)
+                               for k, v in t["args"].items()}}
+                    for t in tmpl]
+
+    return None
 
 
-class Planner:
-    """
-    Generate execution plans from current agent state.
+def _llm_plan(goal: str, context: dict) -> list[dict]:
+    """Generate a plan using Groq LLM when no template matches."""
+    import json
+    import httpx
 
-    The planner uses LLM function-calling to decide which tools
-    to invoke next, based on:
-      1. Current pipeline state
-      2. Working memory (recent steps, tool outputs)
-      3. Available tools
-      4. Past traces for similar documents
-    """
+    from .tools import list_tools
+    tools_desc = json.dumps(list_tools(), indent=2)[:3000]
 
-    def __init__(
-        self,
-        tool_registry: ToolRegistry,
-        memory: AgentMemory,
-    ) -> None:
-        self.tools = tool_registry
-        self.memory = memory
-        self.settings = get_settings()
-        self._client = None
+    system_prompt = f"""You are a planning agent for an academic result extraction system.
+Available tools: {tools_desc}
 
-    @property
-    def client(self):
-        """Lazy-init OpenAI client."""
-        if self._client is None:
-            import openai
-            self._client = openai.AsyncOpenAI(
-                api_key=self.settings.llm.providers["openai"]["api_key"],
-            )
-        return self._client
+Return ONLY a JSON array of steps, each with:
+{{"tool": "tool_name", "args": {{"arg_key": "value_or_{{step_N.field}}"}}, "reason": "why"}}
 
-    async def plan(
-        self,
-        state: AgentState,
-        context: dict[str, Any] | None = None,
-    ) -> list[ToolCall]:
-        """
-        Generate the next set of tool calls.
+Resolve dynamic values using {{step_N.field}} syntax to reference previous step outputs.
+Keep plans short (≤8 steps). Return [] if goal cannot be accomplished with available tools."""
 
-        Args:
-            state: Current agent state
-            context: Additional context (email batch info, etc.)
-
-        Returns:
-            Ordered list of ToolCall objects to execute
-        """
-        # Build context message
-        user_message = self._build_context_message(state, context)
-
-        # Get tool schemas for function calling
-        tool_schemas = self.tools.get_schemas()
-
-        # Call LLM for plan generation
-        plan_data = await self._generate_plan(user_message, tool_schemas)
-
-        # Convert to ToolCall objects
-        tool_calls = []
-        for item in plan_data:
-            tc = ToolCall(
-                tool_name=item["tool"],
-                arguments=item.get("arguments", {}),
-                reasoning=item.get("reasoning", ""),
-            )
-            tool_calls.append(tc)
-
-        logger.info(
-            "plan_generated",
-            state=state.value,
-            num_calls=len(tool_calls),
-            tools=[tc.tool_name for tc in tool_calls],
+    try:
+        resp = httpx.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_GROQ_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": f"Goal: {goal}\nContext: {json.dumps(context)[:500]}"},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 1024,
+            },
+            timeout=20.0,
         )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        # Extract JSON array
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+    except Exception as exc:
+        logger.warning("llm_planner failed: %s", exc)
 
-        return tool_calls
+    return []
 
-    def _build_context_message(
-        self,
-        state: AgentState,
-        context: dict[str, Any] | None,
-    ) -> str:
-        """Build the context message for the planner LLM."""
-        parts = [
-            f"CURRENT STATE: {state.value}",
-            "",
-        ]
 
-        # Recent steps
-        recent = self.memory.get_context_window(max_steps=5)
-        if recent:
-            parts.append("RECENT STEPS:")
-            for step in recent:
-                parts.append(
-                    f"  Step {step['step']}: {step['reasoning']}"
-                )
-                for tc in step["tool_calls"]:
-                    parts.append(
-                        f"    → {tc['tool']}: {tc['result_summary']}"
-                    )
-            parts.append("")
+def create_plan(goal: str, context: dict | None = None) -> list[dict]:
+    """
+    Generate a tool-call plan for a goal.
+    Returns list of {"tool": str, "args": dict} dicts.
+    """
+    ctx = context or {}
 
-        # Reflections
-        reflections = self.memory.get_reflections()
-        if reflections:
-            parts.append("REFLECTIONS:")
-            for r in reflections[-3:]:
-                parts.append(f"  - {r}")
-            parts.append("")
+    # 1. Try rule-based template
+    plan = _match_template(goal, ctx)
+    if plan:
+        logger.info("planner: template match for goal=%r, steps=%d", goal[:60], len(plan))
+        return plan
 
-        # Additional context
-        if context:
-            parts.append("CONTEXT:")
-            for k, v in context.items():
-                parts.append(f"  {k}: {v}")
-            parts.append("")
+    # 2. LLM planning
+    if _GROQ_KEY:
+        plan = _llm_plan(goal, ctx)
+        if plan:
+            logger.info("planner: llm plan for goal=%r, steps=%d", goal[:60], len(plan))
+            return plan
 
-        # Available tools summary
-        tools = self.tools.list_tools()
-        parts.append("AVAILABLE TOOLS:")
-        for tool in tools:
-            parts.append(f"  - {tool.name}: {tool.description[:80]}")
-
-        return "\n".join(parts)
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=15),
-    )
-    async def _generate_plan(
-        self,
-        user_message: str,
-        tool_schemas: list[dict],
-    ) -> list[dict[str, Any]]:
-        """Call LLM to generate a plan."""
-        response = await self.client.chat.completions.create(
-            model=self.settings.agent.planner_model,
-            messages=[
-                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            max_tokens=2048,
-        )
-
-        raw = response.choices[0].message.content
-        data = json.loads(raw)
-
-        # Handle both {"plan": [...]} and [...] formats
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and "plan" in data:
-            return data["plan"]
-        elif isinstance(data, dict) and "tool_calls" in data:
-            return data["tool_calls"]
-        else:
-            logger.warning("unexpected_plan_format", data=str(data)[:200])
-            return []
+    # 3. Fallback: generic email processing
+    logger.warning("planner: no plan found for goal=%r, using default", goal[:60])
+    return _TEMPLATES["process_emails"]

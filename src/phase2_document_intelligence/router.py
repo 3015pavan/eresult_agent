@@ -1,285 +1,148 @@
 """
-Document Router.
+Document Router — Phase 2 entry point.
 
-Central dispatcher that routes documents to the appropriate parsing pipeline
-based on file type detection and content analysis.
+Inspects a document (file path + mime-type) and dispatches to the
+correct parser, returning a normalised ParsedDocument.
 
-Routing logic:
-  1. Detect file type (magic bytes + extension)
-  2. For PDFs: determine native vs scanned
-  3. Route to parser: NativePDFParser, OCRPipeline, ExcelParser
-  4. Handle fallbacks when primary parser fails
+Routing strategy:
+  1. Native PDF (text layer present) → pdf_parser
+  2. Scanned PDF / image → ocr_pipeline
+  3. Excel / CSV                     → excel_parser
+  4. Email body text                 → inline (passed through as-is)
 """
 
 from __future__ import annotations
 
-import io
-import time
-from typing import Any
-from uuid import UUID
+import logging
+import mimetypes
+import os
+from dataclasses import dataclass, field
+from typing import Optional
 
-from src.common.config import get_settings
-from src.common.models import (
-    AttachmentInfo,
-    DocumentType,
-    DocumentParseResult,
-    ExtractedTable,
-)
-from src.common.observability import (
-    get_logger,
-    DOCUMENTS_PARSED,
-    DOCUMENT_PARSE_LATENCY,
-)
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-class DocumentRouter:
+@dataclass
+class ParsedDocument:
+    """Normalised output from any parser in Phase 2."""
+    source_path: str = ""
+    mime_type: str = ""
+    text: str = ""                       # raw extracted text
+    tables: list[list[list[str]]] = field(default_factory=list)  # [ [[cell,...],...]  ]
+    metadata: dict = field(default_factory=dict)
+    parse_strategy: str = "unknown"
+    confidence: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def has_tables(self) -> bool:
+        return bool(self.tables)
+
+    def flat_text(self) -> str:
+        """Return text + flattened tables as a single string for extraction."""
+        parts = [self.text] if self.text else []
+        for tbl in self.tables:
+            for row in tbl:
+                parts.append(", ".join(str(c) for c in row))
+        return "\n".join(parts)
+
+
+def _sniff_mime(path: str) -> str:
+    """Detect mime-type from file extension."""
+    mime, _ = mimetypes.guess_type(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".pdf",):
+        return "application/pdf"
+    if ext in (".xlsx", ".xls"):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if ext in (".csv",):
+        return "text/csv"
+    if ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp"):
+        return f"image/{ext.lstrip('.')}"
+    return mime or "application/octet-stream"
+
+
+def _pdf_has_text(path: str) -> bool:
+    """Return True if the PDF has an extractable text layer."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages[:3]:  # check first 3 pages
+                if page.extract_text():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def route_to_parser(
+    path: str,
+    mime_type: Optional[str] = None,
+    email_body: Optional[str] = None,
+) -> ParsedDocument:
     """
-    Routes documents to appropriate parsing pipelines.
+    Central dispatcher — choose and run the right parser.
 
-    Decision tree:
-      file_type_detect(bytes) →
-        PDF →
-          is_native_pdf(text_density) →
-            YES → NativePDFParser (pdfplumber + camelot)
-            NO  → OCRPipeline (PaddleOCR/Tesseract + LayoutLMv3)
-        XLSX/XLS →
-          ExcelParser (openpyxl + pandas)
-        CSV →
-          CSVParser (pandas)
-        UNKNOWN →
-          Quarantine
+    Args:
+        path:       Filesystem path to the document (empty string for body-only).
+        mime_type:  Optional MIME type hint. Auto-detected if None.
+        email_body: Email body text (used when path is empty or as supplement).
 
-    Fallback chain:
-      NativePDFParser fails → OCRPipeline
-      PaddleOCR fails → Tesseract
-      Tesseract fails → Donut (end-to-end VLM)
-      All fail → Quarantine for human review
+    Returns:
+        ParsedDocument with extracted text and tables.
     """
-
-    # Minimum text density (chars per page) to classify PDF as native
-    MIN_TEXT_DENSITY = 100
-
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        # Lazy imports to avoid loading heavy ML models at startup
-        self._native_parser = None
-        self._ocr_pipeline = None
-        self._excel_parser = None
-
-    @property
-    def native_parser(self):
-        if self._native_parser is None:
-            from .pdf_parser import NativePDFParser
-            self._native_parser = NativePDFParser()
-        return self._native_parser
-
-    @property
-    def ocr_pipeline(self):
-        if self._ocr_pipeline is None:
-            from .ocr_pipeline import OCRPipeline
-            self._ocr_pipeline = OCRPipeline()
-        return self._ocr_pipeline
-
-    @property
-    def excel_parser(self):
-        if self._excel_parser is None:
-            from .excel_parser import ExcelParser
-            self._excel_parser = ExcelParser()
-        return self._excel_parser
-
-    async def parse_document(
-        self,
-        attachment: AttachmentInfo,
-        file_bytes: bytes,
-    ) -> DocumentParseResult:
-        """
-        Route and parse a document through the appropriate pipeline.
-
-        Returns DocumentParseResult with extracted tables, text, and metadata.
-        """
-        start = time.perf_counter()
-
-        try:
-            doc_type = attachment.document_type
-            if doc_type == DocumentType.UNKNOWN:
-                doc_type = self._detect_type(file_bytes, attachment.filename)
-
-            if doc_type in (DocumentType.PDF_NATIVE, DocumentType.PDF_SCANNED):
-                result = await self._parse_pdf(attachment, file_bytes, doc_type)
-            elif doc_type == DocumentType.EXCEL:
-                result = await self._parse_excel(attachment, file_bytes)
-            elif doc_type == DocumentType.CSV:
-                result = await self._parse_csv(attachment, file_bytes)
-            else:
-                result = DocumentParseResult(
-                    attachment_id=attachment.id,
-                    document_type=doc_type,
-                    errors=[f"Unsupported document type: {doc_type.value}"],
-                )
-
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            result.parse_time_ms = elapsed_ms
-
-            DOCUMENTS_PARSED.labels(
-                document_type=doc_type.value,
-                parse_method=result.parse_method,
-            ).inc()
-            DOCUMENT_PARSE_LATENCY.labels(document_type=doc_type.value).observe(
-                elapsed_ms / 1000
+    # ── Body-only (no attachment) ─────────────────────────────────────────────
+    if not path or not os.path.exists(path):
+        if email_body:
+            return ParsedDocument(
+                text=email_body,
+                parse_strategy="email_body",
+                confidence=0.9,
             )
+        return ParsedDocument(errors=["no_document_and_no_body"])
 
-            logger.info(
-                "document_parsed",
-                attachment_id=str(attachment.id),
-                doc_type=doc_type.value,
-                tables=len(result.tables),
-                pages=result.page_count,
-                parse_method=result.parse_method,
-                elapsed_ms=elapsed_ms,
-                errors=result.errors,
-            )
+    mime = mime_type or _sniff_mime(path)
+    logger.info("document_router", path=os.path.basename(path), mime=mime)
 
-            return result
-
-        except Exception as e:
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            logger.error(
-                "document_parse_failed",
-                attachment_id=str(attachment.id),
-                filename=attachment.filename,
-                error=str(e),
-                elapsed_ms=elapsed_ms,
-            )
-            return DocumentParseResult(
-                attachment_id=attachment.id,
-                document_type=attachment.document_type,
-                parse_time_ms=elapsed_ms,
-                errors=[str(e)],
-            )
-
-    async def _parse_pdf(
-        self,
-        attachment: AttachmentInfo,
-        file_bytes: bytes,
-        doc_type: DocumentType,
-    ) -> DocumentParseResult:
-        """
-        Parse a PDF with native→OCR fallback chain.
-
-        Strategy:
-          1. Try native text extraction (pdfplumber)
-          2. Check text density: chars_per_page >= 100 → native PDF
-          3. If native: extract tables with camelot (lattice→stream)
-          4. If scanned: route to OCR pipeline
-          5. If native extraction produces low-confidence tables: try OCR as fallback
-        """
-        # First, attempt native extraction to determine PDF type
-        native_result = await self.native_parser.parse(attachment, file_bytes)
-
-        if native_result.page_count > 0:
-            avg_density = len(native_result.raw_text) / max(native_result.page_count, 1)
+    # ── PDF ───────────────────────────────────────────────────────────────────
+    if "pdf" in mime:
+        if _pdf_has_text(path):
+            from .pdf_parser import parse_pdf_native
+            return parse_pdf_native(path)
         else:
-            avg_density = 0
+            from .ocr_pipeline import parse_pdf_scanned
+            return parse_pdf_scanned(path)
 
-        if avg_density >= self.MIN_TEXT_DENSITY:
-            # Native PDF with text layer
-            if native_result.tables and all(
-                t.confidence >= self.settings.document.table_detection_confidence
-                for t in native_result.tables
-            ):
-                return native_result
+    # ── Excel / CSV ───────────────────────────────────────────────────────────
+    if "spreadsheet" in mime or "excel" in mime or path.endswith((".xlsx", ".xls", ".csv")):
+        from .excel_parser import parse_spreadsheet
+        return parse_spreadsheet(path, mime)
 
-            # Tables not confident enough, try OCR as supplement
-            logger.info(
-                "pdf_native_tables_low_confidence",
-                attachment_id=str(attachment.id),
-                avg_confidence=sum(t.confidence for t in native_result.tables) / max(len(native_result.tables), 1),
-            )
-
-        # Scanned PDF or native with poor tables → OCR pipeline
-        ocr_result = await self.ocr_pipeline.parse(attachment, file_bytes)
-
-        # If OCR produced better results, use it; otherwise merge
-        if ocr_result.tables and (
-            not native_result.tables
-            or ocr_result.tables[0].confidence > native_result.tables[0].confidence
-            if native_result.tables else True
-        ):
-            return ocr_result
-        elif native_result.tables:
-            return native_result
-        else:
-            # Both failed
-            return DocumentParseResult(
-                attachment_id=attachment.id,
-                document_type=DocumentType.PDF_SCANNED,
-                raw_text=native_result.raw_text or ocr_result.raw_text,
-                page_count=native_result.page_count or ocr_result.page_count,
-                errors=native_result.errors + ocr_result.errors + ["No tables extracted from PDF"],
-            )
-
-    async def _parse_excel(
-        self,
-        attachment: AttachmentInfo,
-        file_bytes: bytes,
-    ) -> DocumentParseResult:
-        """Parse an Excel file."""
-        return await self.excel_parser.parse(attachment, file_bytes)
-
-    async def _parse_csv(
-        self,
-        attachment: AttachmentInfo,
-        file_bytes: bytes,
-    ) -> DocumentParseResult:
-        """Parse a CSV file using pandas."""
-        import pandas as pd
-
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    if "html" in mime or path.endswith((".html", ".htm")):
         try:
-            df = pd.read_csv(io.BytesIO(file_bytes))
+            with open(path, encoding="utf-8", errors="replace") as f:
+                html = f.read()
+            from .html_parser import parse_html
+            return parse_html(html, source_path=path)
+        except Exception as exc:
+            return ParsedDocument(errors=[f"html_parse:{exc}"])
 
-            headers = [str(col) for col in df.columns]
-            rows = [[str(val) for val in row] for row in df.values.tolist()]
+    # ── DOCX / ODT / RTF ──────────────────────────────────────────────────────
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if ext in ("docx", "doc", "odt", "ods", "odf", "rtf", "md") or \
+       "wordprocessingml" in mime or "opendocument" in mime or "msword" in mime:
+        from .docx_odf_parser import parse_document_file
+        return parse_document_file(path, mime)
 
-            table = ExtractedTable(
-                page_number=1,
-                headers=headers,
-                rows=rows,
-                confidence=0.95,  # CSV parsing is high confidence
-                num_rows=len(rows),
-                num_cols=len(headers),
-            )
+    # ── Images (standalone scanned page) ─────────────────────────────────────
+    if mime.startswith("image/"):
+        from .universal_converter import ocr_image_path
+        return ocr_image_path(path)
 
-            return DocumentParseResult(
-                attachment_id=attachment.id,
-                document_type=DocumentType.CSV,
-                tables=[table],
-                page_count=1,
-                parse_method="pandas_csv",
-            )
-        except Exception as e:
-            return DocumentParseResult(
-                attachment_id=attachment.id,
-                document_type=DocumentType.CSV,
-                errors=[f"CSV parse error: {e}"],
-            )
-
-    def _detect_type(self, file_bytes: bytes, filename: str) -> DocumentType:
-        """Detect document type from magic bytes and filename."""
-        if file_bytes[:5] == b"%PDF-":
-            return DocumentType.PDF_NATIVE
-
-        if file_bytes[:4] == b"PK\x03\x04":
-            ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
-            if ext in ("xlsx", "xlsm"):
-                return DocumentType.EXCEL
-
-        if file_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-            return DocumentType.EXCEL
-
-        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
-        if ext == "csv":
-            return DocumentType.CSV
-
-        return DocumentType.UNKNOWN
+    # ── Plain text / other ────────────────────────────────────────────────────
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+        return ParsedDocument(text=text, parse_strategy="plain_text", confidence=0.85)
+    except Exception as exc:
+        return ParsedDocument(errors=[f"unhandled_mime:{mime}:{exc}"])

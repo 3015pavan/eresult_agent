@@ -1,169 +1,135 @@
 """
-Table Stitcher.
+Table Stitcher — Phase 2.
 
-Handles multi-page tables by detecting continuation patterns and
-stitching table fragments across page boundaries.
+Merges multi-page tables that were split across PDF pages.
 
-Common patterns in academic result PDFs:
-  - Same column headers repeated on each page (page continuation)
-  - Table continues without headers (just data rows)
-  - Page number or footer text between fragments
-  - Different tables for different semester/subjects
+Detection heuristics:
+  1. Continuation: Last row of page N looks like a data row (no header keywords).
+  2. Header matching: First row of page N+1 matches the header of page N.
+  3. Row count consistency: Pages with same number of columns are candidates.
 """
 
 from __future__ import annotations
 
-from src.common.models import ExtractedTable
-from src.common.observability import get_logger
+import logging
+import re
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+# Keywords that typically appear only in header rows
+_HEADER_KEYWORDS = re.compile(
+    r"\b(subject|code|name|usn|marks|grade|status|result|total|max|pass|fail|"
+    r"serial|no\.?|s\.no|sl\.?|semester|sem|sgpa|cgpa|credits?)\b",
+    re.IGNORECASE,
+)
+
+_NUMERIC_DOMINANT_RE = re.compile(r"^\d+[\d\.\s,/-]*$")
 
 
-class TableStitcher:
-    """
-    Detects and stitches multi-page table fragments.
-
-    Algorithm:
-      1. Group tables by column structure similarity
-      2. For each group, determine if tables are continuation of the same table
-      3. Merge rows while preserving ordering
-      4. Recompute confidence as weighted average
-
-    Heuristics for detecting continuation:
-      - Headers match (exact or fuzzy)
-      - Column count matches
-      - Data type pattern matches (e.g., USN column has consistent format)
-      - Sequential page numbers
-    """
-
-    # Minimum header similarity to consider tables as part of the same group
-    HEADER_SIMILARITY_THRESHOLD = 0.8
-
-    def stitch_tables(self, tables: list[ExtractedTable]) -> list[ExtractedTable]:
-        """
-        Stitch multi-page table fragments into complete tables.
-
-        Input: list of table fragments (possibly from different pages)
-        Output: list of complete tables (fragments merged where appropriate)
-        """
-        if len(tables) <= 1:
-            return tables
-
-        # Sort by page number, then table index
-        sorted_tables = sorted(tables, key=lambda t: (t.page_number, t.table_index))
-
-        # Group tables by column structure
-        groups: list[list[ExtractedTable]] = []
-        current_group: list[ExtractedTable] = [sorted_tables[0]]
-
-        for table in sorted_tables[1:]:
-            if self._should_merge(current_group[-1], table):
-                current_group.append(table)
-            else:
-                groups.append(current_group)
-                current_group = [table]
-
-        groups.append(current_group)
-
-        # Merge each group into a single table
-        result = []
-        for group in groups:
-            if len(group) == 1:
-                result.append(group[0])
-            else:
-                merged = self._merge_group(group)
-                result.append(merged)
-                logger.info(
-                    "tables_merged",
-                    fragment_count=len(group),
-                    pages=[t.page_number for t in group],
-                    result_rows=merged.num_rows,
-                )
-
-        return result
-
-    def _should_merge(self, table_a: ExtractedTable, table_b: ExtractedTable) -> bool:
-        """
-        Determine if two tables should be merged.
-
-        Checks:
-          1. Column count matches (±1)
-          2. Headers match (if both have headers)
-          3. Tables are on consecutive pages
-        """
-        # Column count check
-        if abs(table_a.num_cols - table_b.num_cols) > 1:
-            return False
-
-        # Header similarity check
-        if table_a.headers and table_b.headers:
-            similarity = self._header_similarity(table_a.headers, table_b.headers)
-            if similarity >= self.HEADER_SIMILARITY_THRESHOLD:
-                return True
-
-        # If second table has no headers but same column count → likely continuation
-        if not table_b.headers and table_a.num_cols == table_b.num_cols:
-            if table_b.page_number == table_a.page_number + 1:
-                return True
-
+def _is_header_row(row: list[str]) -> bool:
+    """Return True if the row looks like a table header."""
+    if not row:
         return False
+    hits = sum(1 for cell in row if _HEADER_KEYWORDS.search(cell))
+    return hits >= max(1, len(row) // 3)
 
-    def _merge_group(self, group: list[ExtractedTable]) -> ExtractedTable:
-        """Merge a group of table fragments into a single table."""
-        # Use headers from first table
-        headers = group[0].headers
 
-        # Combine all rows (skip header-like rows in continuation tables)
-        all_rows: list[list[str]] = []
-        for table in group:
-            for row in table.rows:
-                # Skip if row looks like a repeated header
-                if self._is_header_row(row, headers):
-                    continue
-                all_rows.append(row)
+def _cols_match(row_a: list[str], row_b: list[str]) -> bool:
+    """Return True if two rows have the same column count or differ by ≤1."""
+    return abs(len(row_a) - len(row_b)) <= 1
 
-        # Weighted average confidence
-        total_rows = sum(t.num_rows for t in group)
-        avg_confidence = (
-            sum(t.confidence * t.num_rows for t in group) / total_rows
-            if total_rows > 0
-            else 0.0
-        )
 
-        return ExtractedTable(
-            page_number=group[0].page_number,
-            table_index=group[0].table_index,
-            headers=headers,
-            rows=all_rows,
-            confidence=avg_confidence,
-            num_rows=len(all_rows),
-            num_cols=len(headers),
-        )
+def stitch_tables(
+    tables: list[list[list[str]]],
+    similarity_threshold: float = 0.6,
+) -> list[list[list[str]]]:
+    """
+    Merge tables that are continuations of each other across pages.
 
-    @staticmethod
-    def _header_similarity(headers_a: list[str], headers_b: list[str]) -> float:
-        """Compute similarity between two header lists."""
-        if not headers_a or not headers_b:
-            return 0.0
+    Args:
+        tables: List of tables, each a list of rows, each row a list of cell strings.
+        similarity_threshold: Fraction of column names that must match to consider
+                              two tables as the same logical table.
 
-        # Normalize
-        norm_a = [h.lower().strip() for h in headers_a]
-        norm_b = [h.lower().strip() for h in headers_b]
+    Returns:
+        Deduplicated / merged table list.
+    """
+    if len(tables) <= 1:
+        return tables
 
-        # Count exact matches
-        min_len = min(len(norm_a), len(norm_b))
-        matches = sum(1 for i in range(min_len) if norm_a[i] == norm_b[i])
+    result: list[list[list[str]]] = []
+    current = tables[0]
 
-        return matches / max(len(norm_a), len(norm_b))
+    for next_table in tables[1:]:
+        if not next_table:
+            continue
 
-    @staticmethod
-    def _is_header_row(row: list[str], headers: list[str]) -> bool:
-        """Check if a data row is actually a repeated header."""
-        if not headers:
-            return False
+        # Try to detect if next_table is a continuation
+        current_header = current[0] if current else []
+        next_first     = next_table[0] if next_table else []
 
-        norm_row = [cell.lower().strip() for cell in row]
-        norm_headers = [h.lower().strip() for h in headers]
+        if not _cols_match(current_header, next_first):
+            # Different structure — separate tables
+            result.append(current)
+            current = next_table
+            continue
 
-        matches = sum(1 for r, h in zip(norm_row, norm_headers) if r == h)
-        return matches >= len(headers) * 0.7
+        # Check if next page starts with a repetition of the header
+        if _is_header_row(next_first):
+            # Calculate header similarity
+            matched = sum(
+                1 for a, b in zip(current_header, next_first)
+                if a.strip().lower() == b.strip().lower()
+            )
+            total_cols = max(len(current_header), len(next_first), 1)
+            similarity = matched / total_cols
+
+            if similarity >= similarity_threshold:
+                # Same logical table — append rows, skip the repeated header
+                logger.debug(
+                    "table_stitcher: merging continuation table "
+                    "(similarity=%.2f, rows=%d→+%d)",
+                    similarity, len(current), len(next_table) - 1,
+                )
+                current = current + next_table[1:]
+                continue
+
+        # No header on next page — assume it's a direct continuation
+        if not _is_header_row(next_first) and _cols_match(current_header, next_first):
+            logger.debug(
+                "table_stitcher: direct continuation (no header on next page, rows=%d→+%d)",
+                len(current), len(next_table),
+            )
+            current = current + next_table
+            continue
+
+        result.append(current)
+        current = next_table
+
+    result.append(current)
+    return result
+
+
+def extract_student_rows(
+    table: list[list[str]],
+    usn_col_hints: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """
+    Convert a raw table (list of rows) into list of dicts using the header row as keys.
+    USN column is auto-detected if not hinted.
+    """
+    if not table or len(table) < 2:
+        return []
+
+    header = [cell.strip().lower() for cell in table[0]]
+    rows   = table[1:]
+    result: list[dict[str, str]] = []
+
+    for row in rows:
+        if len(row) < len(header):
+            row = row + [""] * (len(header) - len(row))
+        d = {header[i]: (row[i].strip() if i < len(row) else "") for i in range(len(header))}
+        if any(d.values()):
+            result.append(d)
+
+    return result

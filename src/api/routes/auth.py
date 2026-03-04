@@ -26,8 +26,9 @@ router = APIRouter()
 
 # Paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
-TOKEN_FILE = PROJECT_ROOT / "token.json"
+CREDENTIALS_FILE   = PROJECT_ROOT / "config" / "secrets" / "credentials.json"
+TOKEN_FILE         = PROJECT_ROOT / "config" / "secrets" / "token.json"
+CODE_VERIFIER_FILE = PROJECT_ROOT / "data" / "state" / ".oauth_verifier"  # temp PKCE store
 
 # Gmail scopes: read-only email + profile info
 SCOPES = [
@@ -48,6 +49,12 @@ def _load_credentials() -> Credentials | None:
     if not TOKEN_FILE.exists():
         return None
     try:
+        data = json.loads(TOKEN_FILE.read_text())
+        if not data.get("refresh_token"):
+            # Token has no refresh_token — treat as disconnected so we force
+            # a fresh consent and get a proper offline token next login.
+            logger.warning("token_missing_refresh_token")
+            return None
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
         return creds
     except Exception as e:
@@ -57,6 +64,7 @@ def _load_credentials() -> Credentials | None:
 
 def _save_credentials(creds: Credentials) -> None:
     """Save OAuth credentials to token.json."""
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_FILE.write_text(creds.to_json())
     logger.info("token_saved", path=str(TOKEN_FILE))
 
@@ -120,10 +128,12 @@ async def auth_status() -> dict:
 
 
 @router.get("/auth/login")
-async def auth_login():
+async def auth_login(hint: str = None):
     """
     Start Gmail OAuth2 flow.
 
+    Accepts an optional `hint` query param (the user's email address) so
+    Google pre-selects that account on the consent screen.
     Redirects the user to Google's consent screen.
     After consent, Google redirects back to /api/v1/auth/callback.
     """
@@ -139,13 +149,34 @@ async def auth_login():
         redirect_uri=_get_redirect_uri(),
     )
 
-    authorization_url, state = flow.authorization_url(
-        access_type="offline",     # Get refresh token
-        include_granted_scopes="true",
-        prompt="consent",          # Force consent to get refresh_token every time
-    )
+    # Only force consent screen when we don't already have a valid token.
+    # login_hint pre-selects (or auto-selects) the right Google account.
+    existing = _load_credentials()
+    needs_consent = not existing or not existing.valid
 
-    logger.info("oauth_redirect", url=authorization_url)
+    auth_kwargs: dict = {
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+    }
+    if hint:
+        auth_kwargs["login_hint"] = hint
+    if needs_consent:
+        auth_kwargs["prompt"] = "consent"  # ensures we get a refresh_token
+    else:
+        auth_kwargs["prompt"] = "select_account"  # let user pick if multi-account
+
+    authorization_url, state = flow.authorization_url(**auth_kwargs)
+
+    # If the library generated a PKCE code_verifier, persist it so the
+    # callback (which creates a new Flow instance) can use it.
+    verifier = getattr(flow, "code_verifier", None)
+    if verifier:
+        CODE_VERIFIER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CODE_VERIFIER_FILE.write_text(verifier)
+    elif CODE_VERIFIER_FILE.exists():
+        CODE_VERIFIER_FILE.unlink()  # clean up stale verifier from a previous attempt
+
+    logger.info("oauth_redirect", hint=hint, url=authorization_url)
     return RedirectResponse(url=authorization_url)
 
 
@@ -170,6 +201,12 @@ async def auth_callback(code: str = None, error: str = None, state: str = None):
             scopes=SCOPES,
             redirect_uri=_get_redirect_uri(),
         )
+
+        # Restore PKCE code_verifier if the login step saved one
+        if CODE_VERIFIER_FILE.exists():
+            flow.code_verifier = CODE_VERIFIER_FILE.read_text().strip()
+            CODE_VERIFIER_FILE.unlink()
+
         flow.fetch_token(code=code)
         creds = flow.credentials
         _save_credentials(creds)
@@ -181,8 +218,8 @@ async def auth_callback(code: str = None, error: str = None, state: str = None):
             email=user_info.get("email", "unknown"),
         )
 
-        # Redirect back to frontend with success flag
-        return RedirectResponse(url="/?auth=success")
+        # Redirect back to frontend — ?sync=1 tells the UI to auto-sync emails
+        return RedirectResponse(url="/?sync=1")
 
     except Exception as e:
         logger.error("oauth_token_exchange_failed", error=str(e))

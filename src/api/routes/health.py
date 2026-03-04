@@ -29,34 +29,24 @@ async def readiness() -> dict:
     Checks:
       - Database connectivity
       - Redis connectivity
-      - Model availability
     """
     checks = {}
 
-    # Database check
+    # Database check (uses sync psycopg2 pool)
     try:
-        import asyncpg
-        from src.common.config import get_settings
-        settings = get_settings()
-        conn = await asyncpg.connect(dsn=settings.database.url, timeout=5)
-        await conn.fetchval("SELECT 1")
-        await conn.close()
+        from src.common.database import get_connection
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
         checks["database"] = "ok"
     except Exception as e:
         checks["database"] = f"error: {e}"
 
-    # Redis check
+    # Redis check (uses sync redis client)
     try:
-        import redis.asyncio as aioredis
-        from src.common.config import get_settings
-        settings = get_settings()
-        r = aioredis.Redis(
-            host=settings.redis.host,
-            port=settings.redis.port,
-        )
-        await r.ping()
-        await r.aclose()
-        checks["redis"] = "ok"
+        from src.common.cache import get_cache
+        ok = get_cache().ping()
+        checks["redis"] = "ok" if ok else "error: ping failed"
     except Exception as e:
         checks["redis"] = f"error: {e}"
 

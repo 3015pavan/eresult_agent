@@ -1,261 +1,200 @@
 """
-Critic Module.
+Critic — Phase 4.
 
-The Critic evaluates the results of executed steps and provides
-feedback to guide the next planning iteration.
-
-Responsibilities:
-  - Evaluate step outcomes against expected results
-  - Detect anomalies (too few records, all failures, etc.)
-  - Generate reflections for the planner
-  - Decide: continue, retry, escalate, or complete
+Evaluates completed agent runs and individual step outputs.
+Uses rule-based checks and optional LLM evaluation.
 """
 
 from __future__ import annotations
 
-import json
+import logging
+import os
+from dataclasses import dataclass
 from typing import Any
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+logger = logging.getLogger(__name__)
 
-from src.common.config import get_settings
-from src.common.models import AgentStep, AgentState
-from src.common.observability import get_logger
-from src.phase4_agentic_layer.memory import AgentMemory
-
-logger = get_logger(__name__)
+_GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 
 
-CRITIC_SYSTEM_PROMPT = """You are the critic component of an autonomous academic result extraction system.
-
-Your job: Evaluate the results of the last execution step and decide what to do next.
-
-Evaluate based on:
-1. Did the tools execute successfully?
-2. Were the results reasonable? (e.g., expected number of records)
-3. Are there errors that need correction?
-4. Is the overall pipeline making progress?
-
-Output JSON with:
-{
-  "assessment": "success|partial_success|failure",
-  "issues": ["list of identified issues"],
-  "reflections": ["insights for future planning"],
-  "recommendation": "continue|retry|escalate|complete",
-  "reasoning": "explanation of your assessment"
-}"""
+@dataclass
+class CriticResult:
+    passed: bool
+    score: float          # 0.0 – 1.0
+    reason: str
+    suggestions: list[str]
 
 
-class CriticAssessment:
-    """Result of critic evaluation."""
-
-    def __init__(
-        self,
-        assessment: str,
-        issues: list[str],
-        reflections: list[str],
-        recommendation: str,
-        reasoning: str,
-    ) -> None:
-        self.assessment = assessment
-        self.issues = issues
-        self.reflections = reflections
-        self.recommendation = recommendation
-        self.reasoning = reasoning
-
-    @property
-    def should_continue(self) -> bool:
-        return self.recommendation in ("continue", "retry")
-
-    @property
-    def should_complete(self) -> bool:
-        return self.recommendation == "complete"
-
-    @property
-    def should_escalate(self) -> bool:
-        return self.recommendation == "escalate"
-
-
-class Critic:
+class CriticAgent:
     """
-    Evaluate execution results and guide next steps.
+    Evaluates an agent run or individual step result.
 
-    Evaluation criteria:
-      1. Tool success rate: % of tools that executed without error
-      2. Data quality: Are extracted records valid?
-      3. Pipeline progress: Are we moving forward?
-      4. Cost efficiency: Are we using expensive tools unnecessarily?
-      5. Anomaly detection: Unexpected patterns in results
+    Rule-based checks are always applied.  When a Groq key is available,
+    an LLM critique is solicited as well and the scores are averaged.
     """
 
-    def __init__(self, memory: AgentMemory) -> None:
-        self.memory = memory
-        self.settings = get_settings()
-        self._client = None
-
-    @property
-    def client(self):
-        """Lazy-init OpenAI client."""
-        if self._client is None:
-            import openai
-            self._client = openai.AsyncOpenAI(
-                api_key=self.settings.llm.providers["openai"]["api_key"],
-            )
-        return self._client
-
-    async def evaluate(
+    def evaluate_step(
         self,
-        step: AgentStep,
-        state: AgentState,
-        total_steps: int,
-    ) -> CriticAssessment:
-        """
-        Evaluate the last execution step.
-
-        Uses a combination of:
-          1. Heuristic checks (fast, deterministic)
-          2. LLM evaluation (when heuristics are inconclusive)
-        """
-        # First: fast heuristic checks
-        heuristic = self._heuristic_evaluation(step, total_steps)
-        if heuristic:
-            for r in heuristic.reflections:
-                self.memory.add_reflection(r)
-            return heuristic
-
-        # Fall back to LLM evaluation
-        try:
-            llm_result = await self._llm_evaluation(step, state, total_steps)
-            for r in llm_result.reflections:
-                self.memory.add_reflection(r)
-            return llm_result
-        except Exception as e:
-            logger.error("critic_llm_failed", error=str(e))
-            return CriticAssessment(
-                assessment="partial_success",
-                issues=[f"Critic LLM failed: {e}"],
-                reflections=["Critic evaluation was degraded"],
-                recommendation="continue",
-                reasoning="LLM evaluation failed, proceeding with caution",
+        tool: str,
+        args: dict,
+        output: Any,
+        error: str | None,
+    ) -> CriticResult:
+        """Evaluate a single tool invocation."""
+        if error:
+            return CriticResult(
+                passed=False,
+                score=0.0,
+                reason=f"Tool {tool!r} raised error: {error}",
+                suggestions=[f"Retry {tool} with adjusted arguments or skip this step."],
             )
 
-    def _heuristic_evaluation(
-        self,
-        step: AgentStep,
-        total_steps: int,
-    ) -> CriticAssessment | None:
-        """
-        Fast rule-based evaluation.
+        score, reasons, suggestions = self._rule_check_step(tool, output)
 
-        Returns None if heuristics are inconclusive.
-        """
-        if not step.tool_calls:
-            return CriticAssessment(
-                assessment="failure",
-                issues=["No tool calls in step"],
-                reflections=["Empty step detected — planner may be stuck"],
-                recommendation="retry",
-                reasoning="Step had no tool calls to execute",
-            )
+        return CriticResult(
+            passed=score >= 0.5,
+            score=score,
+            reason="; ".join(reasons) or "OK",
+            suggestions=suggestions,
+        )
 
-        # Check for all-failure
-        errors = [
-            tc for tc in step.tool_calls
-            if isinstance(tc.result, dict) and "error" in tc.result
+    def evaluate(self, run: Any) -> CriticResult:
+        """
+        Evaluate a completed AgentRun.
+
+        `run` is expected to have attributes:
+            .goal  str
+            .steps list[dict]   each dict has keys: tool, output, error
+            .final_output Any
+        """
+        score, reasons, suggestions = 1.0, [], []
+
+        steps = getattr(run, "steps", []) or []
+        # Steps can be Step dataclass objects or plain dicts
+        def _step_get(s: Any, key: str, default: Any = None) -> Any:
+            if isinstance(s, dict):
+                return s.get(key, default)
+            return getattr(s, key, default)
+
+        failed = [s for s in steps if _step_get(s, "error")]
+        succeeded = [s for s in steps if not _step_get(s, "error")]
+
+        if not steps:
+            return CriticResult(False, 0.0, "No steps were executed.", ["Check planning logic."])
+
+        # Penalise failed steps
+        if failed:
+            penalty = min(len(failed) * 0.2, 0.6)
+            score -= penalty
+            reasons.append(f"{len(failed)} step(s) failed")
+            for s in failed:
+                suggestions.append(f"Step {_step_get(s, 'tool')} failed: {_step_get(s, 'error')}")
+
+        # Check that extraction/save steps ran
+        tool_names = {_step_get(s, "tool") for s in succeeded}
+        goal_lower = getattr(run, "goal", "").lower()
+
+        if any(w in goal_lower for w in ("email", "extract", "process")):
+            if "extract_records" not in tool_names:
+                score -= 0.15
+                reasons.append("extraction step did not run")
+                suggestions.append("Ensure extract_records is in the plan.")
+            if "save_results" not in tool_names and "save" in goal_lower:
+                score -= 0.10
+                reasons.append("save_results step did not run")
+
+        # LLM critique (optional)
+        if _GROQ_KEY and steps:
+            llm_score, llm_reason = self._llm_critique(run)
+            score = (score + llm_score) / 2
+            if llm_reason:
+                reasons.append(f"LLM: {llm_reason}")
+
+        score = max(0.0, min(1.0, score))
+        return CriticResult(
+            passed=score >= 0.5,
+            score=round(score, 3),
+            reason="; ".join(reasons) or "Run completed successfully",
+            suggestions=suggestions,
+        )
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _rule_check_step(
+        self, tool: str, output: Any
+    ) -> tuple[float, list[str], list[str]]:
+        """Per-tool heuristic checks."""
+        reasons: list[str] = []
+        suggestions: list[str] = []
+        score = 1.0
+
+        if output is None:
+            return 0.3, ["Output is None"], [f"{tool} returned no data — check tool impl."]
+
+        if tool == "extract_records":
+            records = output if isinstance(output, list) else output.get("records", []) if isinstance(output, dict) else []
+            if not records:
+                score = 0.4
+                reasons.append("No records extracted")
+                suggestions.append("Email body may be too sparse; try LLM extractor.")
+            else:
+                for r in records:
+                    if not r.get("usn"):
+                        score -= 0.1
+                        reasons.append("Record missing USN")
+
+        if tool == "validate":
+            if isinstance(output, dict):
+                invalid = output.get("invalid_count", 0)
+                if invalid:
+                    score -= invalid * 0.05
+                    reasons.append(f"{invalid} invalid record(s) after validation")
+
+        if tool == "save_results":
+            saved = output.get("saved", 0) if isinstance(output, dict) else 0
+            if saved == 0:
+                score = 0.4
+                reasons.append("No records were saved")
+
+        return max(0.0, score), reasons, suggestions
+
+    def _llm_critique(self, run: Any) -> tuple[float, str]:
+        """Ask Groq to score the run quality."""
+        import json
+        import httpx
+
+        def _sg(s: Any, key: str, default: Any = None) -> Any:
+            if isinstance(s, dict):
+                return s.get(key, default)
+            return getattr(s, key, default)
+
+        steps_summary = [
+            {"tool": _sg(s, "tool"), "ok": not _sg(s, "error"),
+             "output_len": len(str(_sg(s, "output", "")))}
+            for s in (getattr(run, "steps", []) or [])
         ]
-
-        if len(errors) == len(step.tool_calls):
-            return CriticAssessment(
-                assessment="failure",
-                issues=[
-                    f"{tc.tool_name}: {tc.result.get('error', 'unknown')}"
-                    for tc in errors
-                ],
-                reflections=[
-                    "All tools failed — possible infrastructure issue",
-                ],
-                recommendation="retry" if total_steps < self.settings.agent.max_steps - 2 else "escalate",
-                reasoning="All tool calls in this step failed",
+        prompt = (
+            f"Goal: {getattr(run, 'goal', '')}\n"
+            f"Steps: {json.dumps(steps_summary)}\n\n"
+            "Rate this agent run from 0.0 to 1.0. Respond with just a JSON object: "
+            '{"score": <float>, "reason": "<1-sentence reason>"}'
+        )
+        try:
+            resp = httpx.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {_GROQ_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 80,
+                },
+                timeout=10.0,
             )
-
-        # Check step limit
-        if total_steps >= self.settings.agent.max_steps:
-            return CriticAssessment(
-                assessment="partial_success",
-                issues=["Maximum step limit reached"],
-                reflections=["Step limit reached — saving progress"],
-                recommendation="complete",
-                reasoning=f"Reached max steps ({self.settings.agent.max_steps})",
-            )
-
-        # Check for completion signals
-        for tc in step.tool_calls:
-            if tc.tool_name == "store_records" and isinstance(tc.result, dict):
-                if tc.result.get("status") == "stored":
-                    return CriticAssessment(
-                        assessment="success",
-                        issues=[],
-                        reflections=["Records stored successfully"],
-                        recommendation="complete",
-                        reasoning="Records have been validated and stored",
-                    )
-
-        # Inconclusive — return None to trigger LLM evaluation
-        return None
-
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-    )
-    async def _llm_evaluation(
-        self,
-        step: AgentStep,
-        state: AgentState,
-        total_steps: int,
-    ) -> CriticAssessment:
-        """LLM-based evaluation for complex cases."""
-        # Build context
-        step_summary = {
-            "step_number": step.step_number,
-            "reasoning": step.reasoning,
-            "tool_calls": [
-                {
-                    "tool": tc.tool_name,
-                    "arguments": tc.arguments,
-                    "result": str(tc.result)[:500],
-                    "duration_ms": tc.duration_ms,
-                    "has_error": isinstance(tc.result, dict) and "error" in tc.result,
-                }
-                for tc in step.tool_calls
-            ],
-            "output": str(step.output)[:1000] if step.output else None,
-        }
-
-        user_message = (
-            f"State: {state.value}\n"
-            f"Total steps so far: {total_steps}\n"
-            f"Max steps allowed: {self.settings.agent.max_steps}\n\n"
-            f"Last step:\n{json.dumps(step_summary, indent=2, default=str)}"
-        )
-
-        response = await self.client.chat.completions.create(
-            model=self.settings.agent.planner_model,
-            messages=[
-                {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-            max_tokens=1024,
-        )
-
-        raw = response.choices[0].message.content
-        data = json.loads(raw)
-
-        return CriticAssessment(
-            assessment=data.get("assessment", "partial_success"),
-            issues=data.get("issues", []),
-            reflections=data.get("reflections", []),
-            recommendation=data.get("recommendation", "continue"),
-            reasoning=data.get("reasoning", ""),
-        )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"]
+            data = json.loads(raw)
+            return float(data.get("score", 0.5)), str(data.get("reason", ""))
+        except Exception as exc:
+            logger.debug("critic llm_critique failed: %s", exc)
+            return 0.5, ""

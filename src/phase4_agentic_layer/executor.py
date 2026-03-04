@@ -1,187 +1,132 @@
 """
-Executor Module.
+Executor — Phase 4.
 
-The Executor takes a plan (list of ToolCalls) from the Planner and
-executes them sequentially, recording results in memory.
-
-Responsibilities:
-  - Sequential tool execution with dependency management
-  - Error handling and retry logic per tool
-  - Result recording in working memory
-  - Duration tracking for each tool call
-  - Circuit breaker for repeated failures
+Executes a single plan step with memory context injection
+and standardised error handling.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 import time
 from typing import Any
 
-from src.common.models import ToolCall, AgentStep
-from src.common.observability import get_logger, AGENT_STEPS
-from src.phase4_agentic_layer.tools import ToolRegistry
-from src.phase4_agentic_layer.memory import AgentMemory
+from .tools import call_tool
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-class CircuitBreaker:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_nested(obj: Any, path: str) -> Any:
     """
-    Circuit breaker to prevent cascading failures.
-
-    States:
-      - CLOSED: Normal operation
-      - OPEN: Too many failures → stop calling
-      - HALF_OPEN: After cool-down, try one call
+    Resolve a dotted path like "emails[0].id" or "records" from obj.
+    Supports list indexing: field[N].subfield
     """
+    parts = path.replace("]", "").replace("[", ".").split(".")
+    cur: Any = obj
+    for p in parts:
+        if cur is None:
+            return None
+        if p.isdigit():
+            try:
+                cur = cur[int(p)]
+            except (IndexError, TypeError, KeyError):
+                return None
+        else:
+            try:
+                cur = cur[p]
+            except (KeyError, TypeError):
+                try:
+                    cur = getattr(cur, p)
+                except AttributeError:
+                    return None
+    return cur
 
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        cooldown_seconds: float = 60.0,
-    ) -> None:
-        self.failure_threshold = failure_threshold
-        self.cooldown_seconds = cooldown_seconds
-        self._failures: dict[str, int] = {}
-        self._last_failure_time: dict[str, float] = {}
-        self._state: dict[str, str] = {}  # tool_name → state
 
-    def can_execute(self, tool_name: str) -> bool:
-        """Check if a tool call is allowed."""
-        state = self._state.get(tool_name, "closed")
+def _resolve_args(args: dict, memory: dict) -> dict:
+    """
+    Substitute {step_N.field} and {step_N.field.sub} placeholders
+    in string arg values using memory of previous step outputs.
+    """
+    resolved: dict = {}
+    for key, value in args.items():
+        if not isinstance(value, str):
+            resolved[key] = value
+            continue
 
-        if state == "closed":
-            return True
-        elif state == "open":
-            elapsed = time.time() - self._last_failure_time.get(tool_name, 0)
-            if elapsed >= self.cooldown_seconds:
-                self._state[tool_name] = "half_open"
-                return True
-            return False
-        elif state == "half_open":
-            return True  # Allow one attempt
+        def _sub(m: re.Match) -> str:
+            step_key = m.group(1)   # e.g. "step_0"
+            field    = m.group(2)   # e.g. "emails[0].id"
+            step_out = memory.get(step_key)
+            if step_out is None:
+                return m.group(0)  # leave as-is when step not yet run
+            result = _get_nested(step_out, field)
+            if result is None:
+                return ""
+            if isinstance(result, (dict, list)):
+                import json as _json
+                return _json.dumps(result)
+            return str(result)
 
-        return True
+        replaced = re.sub(r"\{(step_\d+)\.([^}]+)\}", _sub, value)
+        resolved[key] = replaced
 
-    def record_success(self, tool_name: str) -> None:
-        """Record a successful execution."""
-        self._failures[tool_name] = 0
-        self._state[tool_name] = "closed"
+    return resolved
 
-    def record_failure(self, tool_name: str) -> None:
-        """Record a failed execution."""
-        count = self._failures.get(tool_name, 0) + 1
-        self._failures[tool_name] = count
-        self._last_failure_time[tool_name] = time.time()
 
-        if count >= self.failure_threshold:
-            self._state[tool_name] = "open"
+# ── Public API ────────────────────────────────────────────────────────────────
+
+class StepResult:
+    """Return value from execute_step."""
+    __slots__ = ("tool", "output", "error", "duration_ms", "success")
+
+    def __init__(self, tool: str, output: Any, error: str | None, duration_ms: float):
+        self.tool        = tool
+        self.output      = output
+        self.error       = error
+        self.duration_ms = duration_ms
+        self.success     = error is None
+
+
+def execute_step(
+    tool: str,
+    args: dict,
+    memory: dict,
+    *,
+    retries: int = 1,
+) -> StepResult:
+    """
+    Execute a single tool call.
+
+    Args:
+        tool:    Name of the tool to call.
+        args:    Raw args dict (may contain {step_N.field} templates).
+        memory:  Dict of {step_0: output_0, step_1: output_1, …} for template resolution.
+        retries: How many times to retry on transient failure.
+
+    Returns:
+        StepResult with output and timing.
+    """
+    resolved_args = _resolve_args(args, memory)
+    logger.debug("executor: %s(%s)", tool, resolved_args)
+
+    last_error: str | None = None
+    t0 = time.perf_counter()
+
+    for attempt in range(retries + 1):
+        try:
+            output = call_tool(tool, **resolved_args)
+            duration_ms = (time.perf_counter() - t0) * 1000
+            logger.info("executor: %s OK in %.0fms", tool, duration_ms)
+            return StepResult(tool, output, None, duration_ms)
+        except Exception as exc:
+            last_error = str(exc)
             logger.warning(
-                "circuit_breaker_opened",
-                tool=tool_name,
-                failures=count,
+                "executor: %s attempt=%d failed: %s", tool, attempt + 1, exc
             )
 
-
-class Executor:
-    """
-    Execute planned tool calls sequentially.
-
-    Execution flow:
-      1. For each ToolCall in the plan:
-         a. Check circuit breaker
-         b. Execute tool via registry
-         c. Record result and duration
-         d. Update memory
-      2. Return AgentStep with all results
-    """
-
-    def __init__(
-        self,
-        tool_registry: ToolRegistry,
-        memory: AgentMemory,
-    ) -> None:
-        self.tools = tool_registry
-        self.memory = memory
-        self.circuit_breaker = CircuitBreaker()
-
-    async def execute_plan(
-        self,
-        plan: list[ToolCall],
-        step_number: int,
-    ) -> AgentStep:
-        """
-        Execute a plan of tool calls.
-
-        Args:
-            plan: Ordered list of ToolCall objects
-            step_number: Current step number in the agent run
-
-        Returns:
-            AgentStep with executed tool calls and aggregated output
-        """
-        executed_calls: list[ToolCall] = []
-        step_output: dict[str, Any] = {}
-        step_reasoning = ""
-
-        for tc in plan:
-            if step_reasoning:
-                step_reasoning += " → "
-            step_reasoning += tc.reasoning or tc.tool_name
-
-            # Check circuit breaker
-            if not self.circuit_breaker.can_execute(tc.tool_name):
-                logger.warning(
-                    "tool_skipped_circuit_open",
-                    tool=tc.tool_name,
-                )
-                tc.result = {"error": "circuit_breaker_open"}
-                tc.duration_ms = 0
-                executed_calls.append(tc)
-                continue
-
-            # Execute tool
-            start = time.monotonic()
-            try:
-                result = await self.tools.execute(
-                    tc.tool_name,
-                    tc.arguments,
-                )
-                tc.result = result
-                tc.duration_ms = int((time.monotonic() - start) * 1000)
-                self.circuit_breaker.record_success(tc.tool_name)
-
-                # Record in memory
-                self.memory.record_tool_output(tc.tool_name, result)
-                step_output[tc.tool_name] = result
-
-                logger.info(
-                    "tool_executed",
-                    tool=tc.tool_name,
-                    duration_ms=tc.duration_ms,
-                )
-
-            except Exception as e:
-                tc.duration_ms = int((time.monotonic() - start) * 1000)
-                tc.result = {"error": str(e)}
-                self.circuit_breaker.record_failure(tc.tool_name)
-
-                logger.error(
-                    "tool_execution_failed",
-                    tool=tc.tool_name,
-                    error=str(e),
-                    duration_ms=tc.duration_ms,
-                )
-
-            executed_calls.append(tc)
-            AGENT_STEPS.labels(step_type="execute").inc()
-
-        step = AgentStep(
-            step_number=step_number,
-            reasoning=step_reasoning,
-            tool_calls=executed_calls,
-            output=step_output,
-        )
-
-        self.memory.record_step(step)
-        return step
+    duration_ms = (time.perf_counter() - t0) * 1000
+    logger.error("executor: %s FAILED after %d attempts: %s", tool, retries + 1, last_error)
+    return StepResult(tool, None, last_error, duration_ms)
