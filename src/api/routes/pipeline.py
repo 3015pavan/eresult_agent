@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,10 +50,13 @@ def _load_emails_cache() -> list[dict]:
 
 
 def _load_pipeline_state() -> dict:
-    cache = get_cache()
-    state = cache.get_pipeline_state()
-    if state:
-        return state
+    try:
+        cache = get_cache()
+        state = cache.get_pipeline_state()
+        if state:
+            return state
+    except Exception as exc:
+        logger.warning("pipeline_state_cache_read_failed", error=str(exc))
     if PIPELINE_STATE_FILE.exists():
         try:
             return json.loads(PIPELINE_STATE_FILE.read_text())
@@ -67,16 +71,22 @@ def _load_pipeline_state() -> dict:
 
 
 def _save_pipeline_state(state: dict) -> None:
-    get_cache().set_pipeline_state(state)
+    try:
+        get_cache().set_pipeline_state(state)
+    except Exception as exc:
+        logger.warning("pipeline_state_cache_write_failed", error=str(exc))
     PIPELINE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     PIPELINE_STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+
+
+def _pipeline_is_active(state: dict | None = None) -> bool:
+    current = state or _load_pipeline_state()
+    return str(current.get("status") or "").lower() in {"queued", "running"}
 
 
 # ---------------------------------------------------------------------------
 # Classify – inline keyword heuristic (no ML model needed)
 # ---------------------------------------------------------------------------
-
-import re as _cls_re
 
 # Strongly academic — these words almost never appear outside result/marksheet emails
 _STRONG_KEYWORDS = frozenset([
@@ -108,16 +118,33 @@ _NEGATIVE_KEYWORDS = frozenset([
 ])
 
 # USN pattern for classification check
-_USN_CLS_RE = _cls_re.compile(r"\b[1-4][a-z]{2}\d{2}[a-z]{2,4}\d{3}\b", _cls_re.I)
+_USN_CLS_RE = re.compile(r"\b[1-4][a-z]{2}\d{2}[a-z]{2,4}\d{3}\b", re.I)
 
 _ATTACHMENT_EXTS = frozenset([".pdf", ".xlsx", ".xls", ".csv"])
 
 
 def _classify_email(email: dict) -> tuple[str, float]:
-    """Return (classification_label, confidence) using keyword heuristics."""
-    subject = (email.get("subject") or "").lower()
-    body    = (email.get("body") or email.get("snippet") or "").lower()
-    text    = f"{subject} {body}"
+    """
+    Return (classification_label, confidence).
+
+    Pipeline:
+      1. ML classifier (TF-IDF + LogReg, trains on first call)
+      2. Keyword heuristic fallback if ML confidence < 0.65 or unavailable
+    """
+    subject = (email.get("subject") or "")
+    body    = (email.get("body") or email.get("snippet") or "")
+
+    # ── 1. ML classifier (primary) ────────────────────────────────────
+    try:
+        from src.common.email_classifier import classify_email as _ml_classify
+        ml_label, ml_conf = _ml_classify(subject, body)
+        if ml_conf >= 0.65:
+            return ml_label, ml_conf
+    except Exception:
+        pass
+
+    # ── 2. Keyword heuristic fallback ────────────────────────────────
+    text = f"{subject} {body}".lower()
 
     attachments = email.get("attachments") or []
     has_result_attachment = any(
@@ -125,37 +152,25 @@ def _classify_email(email: dict) -> tuple[str, float]:
         for a in attachments
     )
 
-    # ── Negative override: clearly not a result email ────────────────
-    neg_hits = sum(1 for kw in _NEGATIVE_KEYWORDS if kw in text)
+    neg_hits    = sum(1 for kw in _NEGATIVE_KEYWORDS if kw in text)
     if neg_hits >= 2:
         return "other", 0.1
 
-    # ── Count strong and weak keyword hits ───────────────────────────
     strong_hits = sum(1 for kw in _STRONG_KEYWORDS if kw in text)
     weak_hits   = sum(1 for kw in _WEAK_KEYWORDS   if kw in text)
     has_usn     = bool(_USN_CLS_RE.search(text))
 
-    # ── Classification rules (strictest first) ────────────────────────
-    # Rule 1: Any strong keyword → almost certainly a result email
     if strong_hits >= 1:
         confidence = min(0.95, 0.70 + strong_hits * 0.08 + weak_hits * 0.03)
         return "result_email", round(confidence, 2)
-
-    # Rule 2: USN pattern present + at least 2 weak keywords
     if has_usn and weak_hits >= 2:
         confidence = min(0.90, 0.65 + weak_hits * 0.05)
         return "result_email", round(confidence, 2)
-
-    # Rule 3: USN present + result-focused attachment
     if has_usn and has_result_attachment:
         return "result_email", 0.85
-
-    # Rule 4: Attachment with ≥2 weak keywords (e.g. marksheet PDF without USN in body)
     if has_result_attachment and weak_hits >= 2:
         return "result_email", 0.75
-
-    # Rule 5: Exactly "result" or "marks" in subject with weak keyword support
-    subj_has_result = any(kw in subject for kw in ("result", "marks", "marksheet", "grade", "sgpa", "cgpa"))
+    subj_has_result = any(kw in subject.lower() for kw in ("result", "marks", "marksheet", "grade", "sgpa", "cgpa"))
     if subj_has_result and weak_hits >= 2:
         confidence = min(0.85, 0.60 + weak_hits * 0.04)
         return "result_email", round(confidence, 2)
@@ -166,25 +181,23 @@ def _classify_email(email: dict) -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 # Phase 3 – extraction regexes
 # ---------------------------------------------------------------------------
-import re as _re
-
 # Core USN pattern: [1-4][institution-2chars][year-2digits][dept-2-4chars][roll-3digits]
 # Handles: 1MS23CS001, 1MS23CS147, 1RV22IS042, 4BM21CS200, 1MS23EC001, etc.
-_USN_RE   = _re.compile(r"\b([1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3})\b", _re.I)
+_USN_RE   = re.compile(r"\b([1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3})\b", re.I)
 
 # Also match explicit "USN:" and "USN : XXX" annotations in subject/body
-_USN_LABEL_RE = _re.compile(r"(?:USN|Reg(?:istration)?\s*No\.?)[\s:]+([1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3})\b", _re.I)
+_USN_LABEL_RE = re.compile(r"(?:USN|Reg(?:istration)?\s*No\.?)[\s:]+([1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3})\b", re.I)
 
-_SGPA_RE  = _re.compile(r"(?:s\.?g\.?p\.?a|semester\s+gpa|grade\s+point)[^\d]*(\d{1,2}\.\d{1,2})", _re.I)
-_CGPA_RE  = _re.compile(r"(?:c\.?g\.?p\.?a|cumulative\s+gpa|overall\s+gpa)[^\d]*(\d{1,2}\.\d{1,2})", _re.I)
+_SGPA_RE  = re.compile(r"(?:s\.?g\.?p\.?a|semester\s+gpa|grade\s+point)[^\d]*(\d{1,2}\.\d{1,2})", re.I)
+_CGPA_RE  = re.compile(r"(?:c\.?g\.?p\.?a|cumulative\s+gpa|overall\s+gpa)[^\d]*(\d{1,2}\.\d{1,2})", re.I)
 
 # Numeric semester
-_SEM_RE   = _re.compile(r"(?:semester|sem(?:ester)?|term)[^\d]*(\d{1,2})", _re.I)
+_SEM_RE   = re.compile(r"(?:semester|sem(?:ester)?|term)[^\d]*(\d{1,2})", re.I)
 # Ordinal word semester: "fifth semester", "3rd semester", "II semester" etc.
-_SEM_ORD_RE = _re.compile(
+_SEM_ORD_RE = re.compile(
     r"(?:semester|sem)[\s:]+"
     r"(I{1,3}V?|VI{0,3}|IV|VIII?|IX?X?|first|second|third|fourth|fifth|sixth|seventh|eighth|\d{1,2}(?:st|nd|rd|th)?)",
-    _re.I,
+    re.I,
 )
 _ORDINAL_MAP = {
     "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8,
@@ -209,61 +222,61 @@ def _parse_semester(text: str) -> int:
             pass
     return 1
 
-_NAME_RE  = _re.compile(
+_NAME_RE  = re.compile(
     r"(?:student\s*(?:name)?|name|dear)\s*[:\s,]+"
     r"([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){0,4})",
-    _re.I,
+    re.I,
 )
 
 # Format A: subjectcode - Subject Name : 88/100 - PASS   (with optional max_marks)
-_SUBJ_RE  = _re.compile(
+_SUBJ_RE  = re.compile(
     r"^([A-Z0-9]{4,12})\s*[-\u2013:]\s*([^:\n]{3,60}?)[:\s]+(\d{1,3})(?:[/ ](\d{1,3}))?\s*(?:marks?)?\s*[-\u2013]?\s*(PASS|FAIL|P|F)\b",
-    _re.I | _re.MULTILINE,
+    re.I | re.MULTILINE,
 )
 # Format B: bullet/dash list:  - Subject Name: 88/100 - PASS
-_SUBJ_RE2 = _re.compile(
+_SUBJ_RE2 = re.compile(
     r"(?:[-\u2022*]\s*)([^:|\n]{3,50}):\s*(\d{1,3})(?:/(\d{1,3}))?\s*[-\u2013]?\s*(PASS|FAIL)",
-    _re.I,
+    re.I,
 )
 # Format C: Subject: Name | Marks: 88 | Status: PASS
-_SUBJ_RE3 = _re.compile(
+_SUBJ_RE3 = re.compile(
     r"Subject[:\s]+([\w\s&-]+?)\s*\|.*?Marks[:\s]+(\d{1,3}).*?Status[:\s]+(PASS|FAIL)",
-    _re.I,
+    re.I,
 )
 # Format D: VTU pipe table: code | name | cie | see | total | max | grade | status
 # e.g.  21CS51 | Software Engineering | 40 | 62 | 78 | 100 | B | PASS
-_SUBJ_PIPE_RE = _re.compile(
+_SUBJ_PIPE_RE = re.compile(
     r"([A-Z0-9]{4,10})\s*\|\s*([^|\n]{3,50}?)\s*\|[^|]*\|[^|]*\|\s*(\d{1,3})\s*\|\s*(\d{1,3})\s*\|\s*([A-Za-z][+\-]?)\s*\|\s*(PASS|FAIL|P|F)",
-    _re.I,
+    re.I,
 )
 # Format E: plain pipe: name | marks | grade | pass/fail
-_SUBJ_PIPE2_RE = _re.compile(
+_SUBJ_PIPE2_RE = re.compile(
     r"([A-Za-z][\w\s&/()'\-]{2,50}?)\s*\|\s*(\d{1,3})\s*(?:\|[^|]*)?\|\s*(PASS|FAIL|P|F)",
-    _re.I | _re.MULTILINE,
+    re.I | re.MULTILINE,
 )# Format G: VTU grade-only format (no PASS/FAIL — just Grade letter)
 #   "Engineering Mathematics I – 92 – Grade O"
 #   "Data Structures – 92 – Grade O"
-_VTU_GRADE_RE = _re.compile(
+_VTU_GRADE_RE = re.compile(
     r"^(.{3,60}?)\s*[\u2013\-]\s*(\d{1,3})\s*[\u2013\-]\s*Grade\s+([A-Za-z][+\-]?)\s*$",
-    _re.MULTILINE,
+    re.MULTILINE,
 )
 _VTU_FAIL_GRADES = frozenset(["F", "AB", "W", "X"])
 
 # Multi-semester block splitter: "Semester N" or "Semester N Results"
 # Ends at a --- separator line OR the start of the next Semester block.
-_SEM_BLOCK_RE = _re.compile(
+_SEM_BLOCK_RE = re.compile(
     r"Semester\s+(\d{1,2})(?:\s+Results?)?\b[^\n]*\n(.*?)(?=\n[-\u2014]{3,}|\nSemester\s+\d|\Z)",
-    _re.DOTALL | _re.I,
+    re.DOTALL | re.I,
 )
 # Per-block SGPA: "SGPA: 8.7"
-_BLOCK_SGPA_RE = _re.compile(r"SGPA\s*:\s*(\d{1,2}\.\d{1,2})", _re.I)
-_TRAILING_JUNK_RE = _re.compile(r"\s*\n.*$", _re.DOTALL)
+_BLOCK_SGPA_RE = re.compile(r"SGPA\s*:\s*(\d{1,2}\.\d{1,2})", re.I)
+_TRAILING_JUNK_RE = re.compile(r"\s*\n.*$", re.DOTALL)
 
 # CSV / tabular: any_id, subject_name, score, letter_grade
 # Handles formats like: STU001, English, 88, A   or   1, Mathematics, 72, B+
-_CSV_SUBJ_RE = _re.compile(
+_CSV_SUBJ_RE = re.compile(
     r"^[A-Za-z0-9_\-]+\s*,\s*([A-Za-z][A-Za-z0-9\s&/()'\-]{1,50}?)\s*,\s*(\d{1,3})\s*,\s*([A-Za-z][+\-]?)\s*$",
-    _re.MULTILINE,
+    re.MULTILINE,
 )
 # Letter grades that represent failure (Indian university grading)
 _LETTER_FAIL = frozenset(["F", "E", "U", "AB", "W"])
@@ -312,7 +325,7 @@ def _extract_from_body(email: dict) -> list[dict]:
     name_m = _NAME_RE.search(text)
     if name_m:
         raw_name = _TRAILING_JUNK_RE.sub("", name_m.group(1)).strip()
-        raw_name = _re.sub(r"\s+(USN|No|Number|ID|Code|Register|Student)\s*$", "", raw_name, flags=_re.I).strip()
+        raw_name = re.sub(r"\s+(USN|No|Number|ID|Code|Register|Student)\s*$", "", raw_name, flags=re.I).strip()
         # Drop if captured word is a USN itself
         if _USN_RE.match(raw_name.replace(" ", "")):
             raw_name = ""
@@ -621,7 +634,7 @@ def _clear_dedup_cache() -> int:
         return 0
 
 
-def _run_pipeline_sync(force: bool = False) -> dict:
+def _run_pipeline_sync(force: bool = False, task_id: str | None = None) -> dict:
     global _pipeline_running, _pipeline_log
 
     if _pipeline_running:
@@ -638,6 +651,15 @@ def _run_pipeline_sync(force: bool = False) -> dict:
         db.init_db()
         storage = get_storage()
         cache   = get_cache()
+        _save_pipeline_state({
+            **_load_pipeline_state(),
+            "status": "running",
+            "task_id": task_id,
+            "force": force,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "message": "Pipeline worker is processing queued emails.",
+            "log": _pipeline_log,
+        })
 
         # Force mode: clear Redis dedup so all cached emails are re-processed
         if force:
@@ -680,6 +702,7 @@ def _run_pipeline_sync(force: bool = False) -> dict:
             _html_hints = ("<html", "<table", "<br", "<div", "<p>",
                            "&lt;", "&gt;", "&#")
             if body and any(h in body[:500].lower() for h in _html_hints):
+                attachment_id: str | None = None
                 try:
                     from src.phase2_document_intelligence import convert_html_body
                     _html_doc = convert_html_body(body, subject)
@@ -744,6 +767,13 @@ def _run_pipeline_sync(force: bool = False) -> dict:
                 body=body,
             )
             db.update_email_classification(email_db_id, classification, confidence)
+            db.store_pipeline_event(
+                email_id=email_db_id,
+                stage="classification",
+                status=classification,
+                message=f"Email classified as {classification}",
+                payload={"confidence": confidence, "subject": subject},
+            )
 
             emails_processed += 1
             log(f"  [{emails_processed}/{len(emails)}] {subject[:60]} → {classification} ({confidence:.0%})")
@@ -768,19 +798,82 @@ def _run_pipeline_sync(force: bool = False) -> dict:
                     continue
                 log(f"    → Fetching attachment: {att_fname} ({att_mime})")
                 try:
-                    from src.phase2_document_intelligence import convert_gmail_attachment
-                    _att_doc = convert_gmail_attachment(att, msg_id)
+                    from src.phase2_document_intelligence.universal_converter import (
+                        convert_bytes,
+                        fetch_gmail_attachment,
+                    )
+                    att_bytes = fetch_gmail_attachment(
+                        msg_id,
+                        att.get("attachmentId", ""),
+                        att_fname,
+                        att_mime,
+                    )
+                    if not att_bytes:
+                        log(f"      -> Could not fetch attachment bytes for {att_fname}")
+                        continue
+                    att_hash = hashlib.sha256(att_bytes).hexdigest()
+                    att_storage_path = storage.store_attachment(msg_id, att_fname or "attachment", att_bytes)
+                    attachment_id = db.save_attachment(
+                        email_id=email_db_id,
+                        filename=att_fname or "attachment",
+                        content_type=att_mime or "application/octet-stream",
+                        file_size=len(att_bytes),
+                        file_hash=att_hash,
+                        storage_path=att_storage_path,
+                        parse_status="processing",
+                        metadata={"source": "gmail", "message_id": msg_id},
+                    )
+                    _att_doc = convert_bytes(
+                        att_bytes,
+                        att_mime or "application/octet-stream",
+                        filename=att_fname,
+                        source_hint=att_storage_path,
+                    )
                     if _att_doc and _att_doc.text:
                         _att_texts.append(
                             f"[Attachment: {att_fname}]\n{_att_doc.flat_text()}"
                         )
+                        if attachment_id:
+                            db.update_attachment_status(
+                                attachment_id,
+                                parse_status="completed",
+                                document_type=_att_doc.parse_strategy,
+                                metadata={
+                                    "parser": _att_doc.parse_strategy,
+                                    "confidence": _att_doc.confidence,
+                                    "errors": _att_doc.errors,
+                                },
+                            )
+                            db.store_pipeline_event(
+                                email_id=email_db_id,
+                                attachment_id=attachment_id,
+                                stage="attachment_parse",
+                                status="completed",
+                                message=f"Attachment parsed via {_att_doc.parse_strategy}",
+                                payload={"filename": att_fname, "confidence": _att_doc.confidence},
+                            )
                         log(
                             f"      → {len(_att_doc.text)} chars extracted "
                             f"via {_att_doc.parse_strategy}"
                         )
                     else:
+                        if attachment_id:
+                            db.update_attachment_status(
+                                attachment_id,
+                                parse_status="failed",
+                                metadata={"errors": ["no_text_extracted"]},
+                            )
                         log(f"      → No text extracted from {att_fname}")
                 except Exception as _att_exc:
+                    if attachment_id:
+                        try:
+                            db.update_attachment_status(
+                                attachment_id,
+                                parse_status="failed",
+                                metadata={"errors": [str(_att_exc)]},
+                            )
+                        except Exception:
+                            pass
                     logger.warning("attachment_parse_failed %s: %s", att_fname, _att_exc)
 
             if _att_texts:
@@ -825,17 +918,31 @@ def _run_pipeline_sync(force: bool = False) -> dict:
                 confidence=final_confidence,
                 strategy="multi_strategy",
             )
+            db.store_pipeline_event(
+                email_id=email_db_id,
+                stage="extraction",
+                status="completed" if raw_records else "empty",
+                message=f"Extraction produced {len(raw_records)} record(s)",
+                payload={"confidence": final_confidence, "records": len(raw_records)},
+            )
 
             # Route low-confidence extractions to human review
             try:
                 if raw_records and final_confidence < REVIEW_THRESHOLD:
                     queue_id = enqueue_for_review(
                         email_id=msg_id,
-                        subject=subject,
-                        sender=sender,
-                        body=body,
-                        records=raw_records,
+                        email_subject=subject,
+                        email_from=sender,
+                        raw_text=body,
+                        extracted_records=raw_records,
                         confidence=final_confidence,
+                    )
+                    db.store_pipeline_event(
+                        email_id=email_db_id,
+                        stage="review_queue",
+                        status="queued",
+                        message=f"Queued low-confidence extraction {queue_id}",
+                        payload={"confidence": final_confidence},
                     )
                     log(f"    → Low confidence ({final_confidence:.0%}) → review queue {queue_id[:8]}")
             except Exception:
@@ -845,6 +952,13 @@ def _run_pipeline_sync(force: bool = False) -> dict:
             n_saved = _save_records_to_db(raw_records, email_db_id, extraction_id, pre_clean=force)
             records_extracted += n_saved
             db.update_email_status(email_db_id, "completed" if n_saved > 0 else "processed_no_records")
+            db.store_pipeline_event(
+                email_id=email_db_id,
+                stage="persistence",
+                status="completed" if n_saved > 0 else "processed_no_records",
+                message=f"Saved {n_saved} result rows",
+                payload={"saved_rows": n_saved},
+            )
 
             if raw_records:
                 log(f"    → Extracted {len(raw_records)} record(s), {n_saved} results saved ({final_confidence:.0%} conf)")
@@ -898,6 +1012,7 @@ def _run_pipeline_sync(force: bool = False) -> dict:
         state = {
             "last_run": datetime.now(timezone.utc).isoformat(),
             "status": "completed",
+            "task_id": task_id,
             "emails_processed": emails_processed,
             "result_emails": result_emails,
             "records_extracted": records_extracted,
@@ -910,7 +1025,13 @@ def _run_pipeline_sync(force: bool = False) -> dict:
 
     except Exception as exc:
         logger.error("pipeline_error", error=str(exc))
-        _save_pipeline_state({"status": "error", "error": str(exc), "log": _pipeline_log})
+        _save_pipeline_state({
+            "status": "error",
+            "task_id": task_id,
+            "error": str(exc),
+            "message": "Pipeline execution failed.",
+            "log": _pipeline_log,
+        })
         raise
     finally:
         _pipeline_running = False
@@ -926,6 +1047,8 @@ class PipelineRunRequest(BaseModel):
 
 class PipelineRunResponse(BaseModel):
     status: str
+    task_id: str | None = None
+    async_mode: bool = False
     emails_processed: int = 0
     result_emails: int = 0
     records_extracted: int = 0
@@ -941,28 +1064,51 @@ async def run_pipeline(request: PipelineRunRequest = PipelineRunRequest()) -> di
     Set ``force=true`` in the request body to clear Redis dedup cache and
     re-process all cached emails from scratch.
     """
-    import asyncio
-
-    if _pipeline_running:
+    if _pipeline_running or _pipeline_is_active():
         raise HTTPException(status_code=409, detail="Pipeline is already running")
-
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: _run_pipeline_sync(force=request.force))
-
-    # Append current DB totals to the log so the UI can display them
     try:
-        db.init_db()
-        stats = db.get_pipeline_stats()
-        result.setdefault("log", []).append(
-            f"\nDatabase totals: {stats.get('total_students', 0)} students | "
-            f"{stats.get('total_results', 0)} result records | "
-            f"{stats.get('emails_processed', 0)} emails | "
-            f"Avg CGPA: {float(stats.get('average_cgpa') or 0):.2f}"
-        )
-    except Exception:
-        pass
+        from src.tasks.pipeline_runner import run_pipeline_batch
 
-    return result
+        task = run_pipeline_batch.apply_async(
+            kwargs={"force": request.force},
+            queue="email_ingestion",
+        )
+        queued_state = {
+            "last_run": None,
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "status": "queued",
+            "task_id": task.id,
+            "force": request.force,
+            "emails_processed": 0,
+            "result_emails": 0,
+            "records_extracted": 0,
+            "skipped_dedup": 0,
+            "message": "Pipeline queued successfully.",
+            "log": ["Pipeline queued. Worker will start shortly."],
+        }
+        _save_pipeline_state(queued_state)
+        return {**queued_state, "async_mode": True}
+    except Exception as exc:
+        logger.warning("pipeline_queue_unavailable_falling_back_sync", error=str(exc))
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _run_pipeline_sync(force=request.force))
+        result["async_mode"] = False
+
+        try:
+            db.init_db()
+            stats = db.get_pipeline_stats()
+            result.setdefault("log", []).append(
+                f"\nDatabase totals: {stats.get('total_students', 0)} students | "
+                f"{stats.get('email_students', 0)} from email | "
+                f"{stats.get('admin_students', 0)} from admin uploads | "
+                f"Avg CGPA: {float(stats.get('average_cgpa') or 0):.2f}"
+            )
+        except Exception:
+            pass
+
+        return result
 
 
 @router.get("/pipeline/status")
@@ -971,10 +1117,28 @@ async def pipeline_status() -> dict:
     db.init_db()
     state = _load_pipeline_state()
     stats = db.get_pipeline_stats()
+    task_status = None
+    task_result = None
+    task_id = state.get("task_id")
+    if task_id:
+        try:
+            from celery.result import AsyncResult
+            from src.common.celery_app import celery_app
+
+            result = AsyncResult(task_id, app=celery_app)
+            task_status = result.status
+            if result.successful():
+                task_result = result.result
+            elif result.failed():
+                task_result = str(result.result)
+        except Exception as exc:
+            logger.debug("pipeline_task_status_unavailable", error=str(exc))
     return {
         "pipeline": state,
         "database": stats,
-        "running": _pipeline_running,
+        "running": _pipeline_running or _pipeline_is_active(state),
+        "task_status": task_status,
+        "task_result": task_result,
         "log_tail": _pipeline_log[-10:] if _pipeline_log else [],
     }
 
@@ -1031,10 +1195,13 @@ async def reset_pipeline() -> dict:
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             for tbl in (
-                "extractions", "attachments", "email_metadata",
+                "app_extractions", "extractions", "attachments", "email_metadata",
                 "semester_aggregates", "student_results", "students",
             ):
-                cur.execute(f"DELETE FROM {tbl}")
+                try:
+                    cur.execute(f"DELETE FROM {tbl}")
+                except Exception:
+                    conn.rollback()  # skip if table doesn't exist
     # Clear Redis pipeline state + dedup keys
     try:
         get_cache().clear_pipeline_state()
@@ -1048,24 +1215,33 @@ async def reset_pipeline() -> dict:
 
 @router.delete("/pipeline/clear-seeds")
 async def clear_seed_data() -> dict:
-    """Remove only seeded test students and their results (keeps real pipeline data intact)."""
+    """Remove seeded test students and their results (keeps real pipeline/upload data intact)."""
     db.init_db()
     deleted = 0
     with db.get_connection() as conn:
         with conn.cursor() as cur:
-            # Cascade: delete results/aggregates for seed students first
-            cur.execute("""
-                DELETE FROM semester_aggregates
-                WHERE student_id IN (
-                    SELECT id FROM students WHERE metadata->>'source' = 'seed'
-                )
-            """)
-            cur.execute("""
-                DELETE FROM student_results
-                WHERE student_id IN (
-                    SELECT id FROM students WHERE metadata->>'source' = 'seed'
-                )
-            """)
-            cur.execute("DELETE FROM students WHERE metadata->>'source' = 'seed'")
-            deleted = cur.rowcount
+            # Real students have metadata->>'source' IN ('pipeline','upload')
+            # Seeds/untagged students have empty metadata {}, NULL, or source='seed'
+            seed_filter = """
+                metadata IS NULL
+                OR NOT (metadata ? 'source')
+                OR metadata->>'source' = 'seed'
+            """
+            # Count first so we always report accurately
+            cur.execute(f"SELECT COUNT(*) FROM students WHERE {seed_filter}")
+            deleted = cur.fetchone()[0]
+            if deleted > 0:
+                cur.execute(f"""
+                    DELETE FROM semester_aggregates
+                    WHERE student_id IN (
+                        SELECT id FROM students WHERE {seed_filter}
+                    )
+                """)
+                cur.execute(f"""
+                    DELETE FROM student_results
+                    WHERE student_id IN (
+                        SELECT id FROM students WHERE {seed_filter}
+                    )
+                """)
+                cur.execute(f"DELETE FROM students WHERE {seed_filter}")
     return {"cleared": True, "seed_students_removed": deleted}

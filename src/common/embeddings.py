@@ -13,11 +13,10 @@ import logging
 import os
 from typing import Optional
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 _MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+_CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 _OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 _GROQ_KEY   = os.getenv("GROQ_API_KEY", "")
 
@@ -25,6 +24,7 @@ _GROQ_KEY   = os.getenv("GROQ_API_KEY", "")
 _TARGET_DIM = 1536
 
 _st_model = None
+_cross_encoder_model = None
 
 
 def _get_sentence_transformer():
@@ -39,6 +39,53 @@ def _get_sentence_transformer():
             logger.warning("sentence-transformers not installed. Using deterministic hash embeddings.")
             _st_model = False
     return _st_model
+
+
+def _get_cross_encoder():
+    """Lazy-load cross-encoder model for reranking. Returns None if unavailable."""
+    global _cross_encoder_model
+    if _cross_encoder_model is None:
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+            _cross_encoder_model = CrossEncoder(_CROSS_ENCODER_MODEL)
+            logger.info("Loaded cross-encoder model: %s", _CROSS_ENCODER_MODEL)
+        except Exception:
+            _cross_encoder_model = False
+    return _cross_encoder_model if _cross_encoder_model is not False else None
+
+
+def rerank_results(query: str, candidates: list[dict], text_field: str = "name") -> list[dict]:
+    """
+    Rerank a list of candidate dicts by cross-encoder (query, doc) similarity.
+
+    Args:
+        query: The user query string.
+        candidates: List of dicts, each with at least `text_field` key.
+        text_field: Key in each dict whose value is used as the document text.
+
+    Returns candidates sorted by reranked score DESC.
+    Cross-encoder score is added as `rerank_score` key.
+    Falls back to original order if the model is unavailable.
+    """
+    if not candidates:
+        return candidates
+
+    model = _get_cross_encoder()
+    if model is None:
+        return candidates
+
+    try:
+        pairs = [
+            (query, f"{c.get('usn', '')} {c.get(text_field, '')}".strip())
+            for c in candidates
+        ]
+        scores = model.predict(pairs).tolist()
+        for c, score in zip(candidates, scores):
+            c["rerank_score"] = float(score)
+        return sorted(candidates, key=lambda x: x.get("rerank_score", 0), reverse=True)
+    except Exception as exc:
+        logger.debug("rerank_results failed: %s", exc)
+        return candidates
 
 
 def _hash_embedding(text: str, dim: int = _TARGET_DIM) -> list[float]:
@@ -121,15 +168,64 @@ def store_student_embedding(student_id: str, usn: str, name: str, results_summar
         return False
 
 
+def _cross_encoder_rerank(
+    query: str,
+    candidates: list[dict],
+    text_field: str = "full_name",
+    model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+) -> list[dict]:
+    """
+    Rerank candidate records using a cross-encoder model.
+
+    Each candidate dict must have at least a `text_field` key (default 'full_name').
+    Returns candidates sorted by cross-encoder score (descending).
+    Falls back to the original order if the model is not installed.
+    """
+    try:
+        from sentence_transformers import CrossEncoder
+        ce = CrossEncoder(model)
+        pairs = [(query, str(c.get(text_field, c.get("usn", "")))) for c in candidates]
+        scores = ce.predict(pairs)
+        ranked = sorted(
+            zip(scores, candidates),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        reranked = []
+        for score, cand in ranked:
+            c = dict(cand)
+            c["rerank_score"] = float(score)
+            reranked.append(c)
+        return reranked
+    except ImportError:
+        # sentence-transformers not installed or model not found
+        return candidates
+    except Exception as exc:
+        logger.debug("cross_encoder_rerank failed: %s", exc)
+        return candidates
+
+
 def semantic_search_students(
     query: str,
     institution_id: str,
     limit: int = 10,
-    threshold: float = 0.7,
+    threshold: float = 0.0,
+    rerank: bool = True,
 ) -> list[dict]:
     """
-    Search students by semantic similarity using pgvector cosine distance.
-    Falls back to text LIKE search if pgvector is unavailable.
+    Search students by semantic similarity using pgvector cosine distance,
+    then optionally rerank results with a cross-encoder for higher precision.
+
+    Steps:
+      1. Fetch `limit * 3` candidates from pgvector (first-stage ANN)
+      2. Filter by minimum cosine similarity threshold (default 0.0 = return all)
+      3. Apply cross-encoder reranking (if `rerank=True` and model available)
+      4. Return top `limit` results
+
+    Note: When using hash-based fallback embeddings (no API key / sentence-transformers),
+    all cosine similarities will be near-zero.  Keep threshold=0.0 in that case and rely
+    on reranking or name-based search instead.  Set threshold ≥ 0.70 only when real
+    semantic embeddings are configured.
     """
     try:
         from src.common.database import get_connection  # avoid circular import
@@ -137,6 +233,8 @@ def semantic_search_students(
 
         vec = embed_text(query)
         pg_literal = _vec_to_pg_literal(vec)
+        # Fetch 3× candidates for reranking headroom
+        candidate_limit = limit * 3 if rerank else limit
 
         with get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -153,14 +251,24 @@ def semantic_search_students(
                       AND profile_embedding IS NOT NULL
                     ORDER BY profile_embedding <=> %s::vector
                     LIMIT %s
-                """, (pg_literal, institution_id, pg_literal, limit))
+                """, (pg_literal, institution_id, pg_literal, candidate_limit))
                 rows = cur.fetchall()
-                return [
+                candidates = [
                     {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
                      for k, v in dict(r).items()}
                     for r in rows
                     if float(r.get("similarity") or 0) >= threshold
                 ]
+
+        if not candidates:
+            return []
+
+        # Cross-encoder reranking (best-effort, falls back to cosine order)
+        if rerank and len(candidates) > 1:
+            candidates = _cross_encoder_rerank(query, candidates, text_field="full_name")
+
+        return candidates[:limit]
+
     except Exception as exc:
         logger.debug("semantic_search_students failed: %s", exc)
         return []

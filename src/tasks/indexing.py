@@ -31,7 +31,7 @@ def index_student(self, usn: str) -> dict:
             with get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT student_id, usn, name FROM students WHERE usn = %s", (usn,)
+                        "SELECT id, usn, name FROM students WHERE usn = %s", (usn,)
                     )
                     row = cur.fetchone()
         except Exception:
@@ -70,7 +70,7 @@ def rebuild_all_embeddings(self) -> dict:
         try:
             with get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT student_id, usn, name FROM students")
+                    cur.execute("SELECT id, usn, name FROM students")
                     rows = cur.fetchall()
         except Exception:
             return {"status": "db_error"}
@@ -109,7 +109,7 @@ def refresh_elasticsearch(self) -> dict:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT s.student_id, s.usn, s.name, s.cgpa, s.total_backlogs
+                        SELECT s.id, s.usn, s.name, s.cgpa, s.total_backlogs
                         FROM students s
                         ORDER BY s.created_at DESC
                         LIMIT 5000
@@ -164,3 +164,56 @@ def _es_bulk_index(docs: list[dict]) -> int:
     except Exception as exc:
         logger.debug("_es_bulk_index: %s", exc)
         return 0
+
+
+def _es_bulk_index_emails(docs: list[dict]) -> int:
+    """Bulk-index email documents to Elasticsearch `emails` index."""
+    if not docs:
+        return 0
+    try:
+        from src.common.elasticsearch_client import es_client, bulk_index, ensure_email_index
+        ensure_email_index()
+        return bulk_index(es_client(), "emails", docs)
+    except Exception as exc:
+        logger.debug("_es_bulk_index_emails: %s", exc)
+        return 0
+
+
+@celery_app.task(
+    name="tasks.refresh_email_index",
+    bind=True,
+    queue="indexing",
+)
+def refresh_email_index(self) -> dict:
+    """
+    Index all cached emails into Elasticsearch for full-text search.
+    Reads from data/emails_cache.json — safe to run repeatedly.
+    """
+    try:
+        import json, os
+        cache_path = "data/emails_cache.json"
+        if not os.path.exists(cache_path):
+            return {"status": "no_cache"}
+
+        emails = json.loads(open(cache_path).read())
+        docs = [
+            {
+                "id":             e.get("id", ""),
+                "subject":        e.get("subject", ""),
+                "from":           e.get("from", ""),
+                "body":           (e.get("body", "") or "")[:5000],
+                "date":           e.get("date", ""),
+                "snippet":        e.get("snippet", ""),
+                "thread_id":      e.get("threadId", e.get("message_id", "")),
+                "classification": e.get("classification", ""),
+            }
+            for e in emails
+            if e.get("id")
+        ]
+        indexed = _es_bulk_index_emails(docs)
+        logger.info("refresh_email_index: indexed %d/%d emails", indexed, len(docs))
+        return {"status": "ok", "indexed": indexed, "total": len(docs)}
+
+    except Exception as exc:
+        logger.error("refresh_email_index failed: %s", exc)
+        raise self.retry(exc=exc)

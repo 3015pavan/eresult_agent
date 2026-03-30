@@ -1,10 +1,9 @@
 """
-MinIO object storage layer.
+Object storage abstraction for AcadExtract.
 
-Stores raw email JSON and attachment bytes in S3-compatible object storage.
-Buckets:
-  emails-raw    — {year}/{month}/{message_id}.json
-  attachments   — {email_id}/{filename}
+Supports:
+  - MinIO / S3-compatible storage
+  - Supabase Storage (REST API)
 """
 
 from __future__ import annotations
@@ -12,146 +11,212 @@ from __future__ import annotations
 import io
 import json
 import logging
-import os
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Protocol
 
-from minio import Minio
-from minio.error import S3Error
+import httpx
 
 logger = logging.getLogger(__name__)
 
-BUCKET_EMAILS = os.getenv("MINIO_BUCKET_EMAILS", "emails-raw")
-BUCKET_ATTACHMENTS = os.getenv("MINIO_BUCKET_ATTACHMENTS", "attachments")
+try:
+    from minio import Minio
+    from minio.error import S3Error
+    _HAS_MINIO = True
+except ImportError:
+    _HAS_MINIO = False
+    Minio = None
+    S3Error = Exception
 
 
-def _get_client() -> Minio:
-    endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9000")
-    access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-    secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-    secure = os.getenv("MINIO_SECURE", "false").lower() == "true"
-    return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+class StorageBackend(Protocol):
+    def ensure_buckets(self) -> None: ...
+    def store_email(self, message_id: str, email_dict: dict) -> str: ...
+    def get_email(self, path: str) -> dict: ...
+    def store_attachment(self, email_id: str, filename: str, data: bytes) -> str: ...
+
+
+def _safe_object_name(name: str) -> str:
+    return (
+        name.replace("\\", "_")
+        .replace("/", "_")
+        .replace("<", "")
+        .replace(">", "")
+        .replace(" ", "_")
+    )
 
 
 class MinIOStorage:
-    """Wrapper around Minio client with bucket management and retry logic."""
+    """Wrapper around MinIO client with bucket management."""
 
     def __init__(self):
+        from src.common.config import get_settings
+
+        cfg = get_settings().storage
+        self.bucket_emails = cfg.minio_bucket_emails
+        self.bucket_attachments = cfg.minio_bucket_attachments
         self._client: Optional[Minio] = None
+        self._endpoint = cfg.minio_endpoint
+        self._access_key = cfg.minio_access_key
+        self._secret_key = cfg.minio_secret_key
+        self._secure = cfg.minio_secure
 
     @property
     def client(self) -> Minio:
+        if not _HAS_MINIO:
+            raise RuntimeError("minio package not installed")
         if self._client is None:
-            self._client = _get_client()
+            self._client = Minio(
+                self._endpoint,
+                access_key=self._access_key,
+                secret_key=self._secret_key,
+                secure=self._secure,
+            )
         return self._client
 
-    # ── Bucket management ─────────────────────────────────────────────────────
-
     def ensure_buckets(self) -> None:
-        """Create required buckets if they don't exist yet."""
-        for bucket in (BUCKET_EMAILS, BUCKET_ATTACHMENTS):
-            try:
-                if not self.client.bucket_exists(bucket):
-                    self.client.make_bucket(bucket)
-                    logger.info("Created MinIO bucket: %s", bucket)
-                else:
-                    logger.debug("MinIO bucket already exists: %s", bucket)
-            except S3Error as exc:
-                logger.error("Failed to create/check bucket %s: %s", bucket, exc)
-                raise
-
-    # ── Email storage ─────────────────────────────────────────────────────────
+        for bucket in (self.bucket_emails, self.bucket_attachments):
+            if not self.client.bucket_exists(bucket):
+                self.client.make_bucket(bucket)
+                logger.info("Created MinIO bucket: %s", bucket)
 
     def store_email(self, message_id: str, email_dict: dict) -> str:
-        """
-        Persist the raw email dict as JSON to MinIO.
-
-        Returns the object path (e.g. '2025/03/abc123.json').
-        """
-        now = datetime.utcnow()
-        safe_id = message_id.replace("/", "_").replace("<", "").replace(">", "")
+        now = datetime.now(timezone.utc)
+        safe_id = _safe_object_name(message_id)
         object_path = f"{now.year}/{now.month:02d}/{safe_id}.json"
-
         payload = json.dumps(email_dict, ensure_ascii=False, default=str).encode("utf-8")
         data = io.BytesIO(payload)
-
-        try:
-            self.client.put_object(
-                BUCKET_EMAILS,
-                object_path,
-                data,
-                length=len(payload),
-                content_type="application/json",
-            )
-            logger.debug("Stored email %s at %s/%s", message_id, BUCKET_EMAILS, object_path)
-        except S3Error as exc:
-            logger.error("MinIO put_object failed for %s: %s", message_id, exc)
-            raise
-
-        return f"s3://{BUCKET_EMAILS}/{object_path}"
+        self.client.put_object(
+            self.bucket_emails,
+            object_path,
+            data,
+            length=len(payload),
+            content_type="application/json",
+        )
+        return f"s3://{self.bucket_emails}/{object_path}"
 
     def get_email(self, path: str) -> dict:
-        """
-        Retrieve an email dict from MinIO.
-
-        Accepts either the full s3:// URI or a bare object path.
-        """
-        if path.startswith("s3://"):
-            # Strip scheme and bucket prefix
-            without_scheme = path[len("s3://"):]
-            _, object_path = without_scheme.split("/", 1)
-        else:
-            object_path = path
-
-        try:
-            response = self.client.get_object(BUCKET_EMAILS, object_path)
-            data = response.read()
-            return json.loads(data.decode("utf-8"))
-        except S3Error as exc:
-            logger.error("MinIO get_object failed for %s: %s", path, exc)
-            raise
-
-    # ── Attachment storage ────────────────────────────────────────────────────
+        object_path = path.split("/", 3)[-1] if path.startswith("s3://") else path
+        response = self.client.get_object(self.bucket_emails, object_path)
+        data = response.read()
+        return json.loads(data.decode("utf-8"))
 
     def store_attachment(self, email_id: str, filename: str, data: bytes) -> str:
-        """
-        Store an attachment binary in MinIO.
-
-        Returns the object path.
-        """
-        safe_name = filename.replace(" ", "_")
-        object_path = f"{email_id}/{safe_name}"
-
-        buf = io.BytesIO(data)
-        try:
-            self.client.put_object(
-                BUCKET_ATTACHMENTS,
-                object_path,
-                buf,
-                length=len(data),
-            )
-            logger.debug("Stored attachment %s at %s/%s", filename, BUCKET_ATTACHMENTS, object_path)
-        except S3Error as exc:
-            logger.error("MinIO put attachment failed for %s: %s", filename, exc)
-            raise
-
-        return f"s3://{BUCKET_ATTACHMENTS}/{object_path}"
+        object_path = f"{_safe_object_name(email_id)}/{_safe_object_name(filename)}"
+        self.client.put_object(
+            self.bucket_attachments,
+            object_path,
+            io.BytesIO(data),
+            length=len(data),
+        )
+        return f"s3://{self.bucket_attachments}/{object_path}"
 
     def presigned_url(self, bucket: str, object_path: str, expires_hours: int = 1) -> str:
-        """Generate a presigned GET URL valid for *expires_hours* hours."""
-        from datetime import timedelta
-        url = self.client.presigned_get_object(
-            bucket, object_path, expires=timedelta(hours=expires_hours)
+        return self.client.presigned_get_object(
+            bucket,
+            object_path,
+            expires=timedelta(hours=expires_hours),
         )
-        return url
 
 
-# Singleton helper -  lazily constructed
-_storage: Optional[MinIOStorage] = None
+class SupabaseStorage:
+    """Minimal Supabase Storage client using REST endpoints."""
+
+    def __init__(self):
+        from src.common.config import get_settings
+
+        cfg = get_settings().storage
+        if not cfg.supabase_configured:
+            raise RuntimeError("Supabase storage not configured")
+        self.base_url = cfg.supabase_url.rstrip("/")
+        self.service_key = cfg.supabase_service_key
+        self.bucket_emails = cfg.supabase_bucket_emails
+        self.bucket_attachments = cfg.supabase_bucket_attachments
+        self._client = httpx.Client(
+            timeout=30.0,
+            headers={
+                "Authorization": f"Bearer {self.service_key}",
+                "apikey": self.service_key,
+            },
+        )
+
+    def _object_url(self, bucket: str, object_path: str) -> str:
+        return f"{self.base_url}/storage/v1/object/{bucket}/{object_path}"
+
+    def _bucket_url(self) -> str:
+        return f"{self.base_url}/storage/v1/bucket"
+
+    def ensure_buckets(self) -> None:
+        for bucket in (self.bucket_emails, self.bucket_attachments):
+            try:
+                resp = self._client.post(
+                    self._bucket_url(),
+                    json={"id": bucket, "name": bucket, "public": False},
+                )
+                if resp.status_code not in (200, 201, 409):
+                    resp.raise_for_status()
+            except Exception as exc:
+                logger.warning("supabase_bucket_ensure_failed %s: %s", bucket, exc)
+                raise
+
+    def store_email(self, message_id: str, email_dict: dict) -> str:
+        now = datetime.now(timezone.utc)
+        object_path = f"{now.year}/{now.month:02d}/{_safe_object_name(message_id)}.json"
+        payload = json.dumps(email_dict, ensure_ascii=False, default=str).encode("utf-8")
+        resp = self._client.post(
+            self._object_url(self.bucket_emails, object_path),
+            headers={"x-upsert": "true", "content-type": "application/json"},
+            content=payload,
+        )
+        resp.raise_for_status()
+        return f"supabase://{self.bucket_emails}/{object_path}"
+
+    def get_email(self, path: str) -> dict:
+        object_path = path.split("/", 3)[-1] if path.startswith("supabase://") else path
+        resp = self._client.get(self._object_url(self.bucket_emails, object_path))
+        resp.raise_for_status()
+        return resp.json() if isinstance(resp.json(), dict) else json.loads(resp.text)
+
+    def store_attachment(self, email_id: str, filename: str, data: bytes) -> str:
+        object_path = f"{_safe_object_name(email_id)}/{_safe_object_name(filename)}"
+        resp = self._client.post(
+            self._object_url(self.bucket_attachments, object_path),
+            headers={"x-upsert": "true", "content-type": "application/octet-stream"},
+            content=data,
+        )
+        resp.raise_for_status()
+        return f"supabase://{self.bucket_attachments}/{object_path}"
 
 
-def get_storage() -> MinIOStorage:
+class UnifiedStorage:
+    """Facade selecting MinIO or Supabase based on configuration."""
+
+    def __init__(self):
+        from src.common.config import get_settings
+
+        cfg = get_settings().storage
+        if cfg.backend.lower() == "supabase" and cfg.supabase_configured:
+            self.backend: StorageBackend = SupabaseStorage()
+        else:
+            self.backend = MinIOStorage()
+
+    def ensure_buckets(self) -> None:
+        self.backend.ensure_buckets()
+
+    def store_email(self, message_id: str, email_dict: dict) -> str:
+        return self.backend.store_email(message_id, email_dict)
+
+    def get_email(self, path: str) -> dict:
+        return self.backend.get_email(path)
+
+    def store_attachment(self, email_id: str, filename: str, data: bytes) -> str:
+        return self.backend.store_attachment(email_id, filename, data)
+
+
+_storage: Optional[UnifiedStorage] = None
+
+
+def get_storage() -> UnifiedStorage:
     global _storage
     if _storage is None:
-        _storage = MinIOStorage()
+        _storage = UnifiedStorage()
     return _storage

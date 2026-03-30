@@ -29,6 +29,8 @@ class ParsedDocument:
     mime_type: str = ""
     text: str = ""                       # raw extracted text
     tables: list[list[list[str]]] = field(default_factory=list)  # [ [[cell,...],...]  ]
+    # Per-cell confidence scores — same shape as `tables` (None = unavailable)
+    cell_confidences: list[list[list[float]]] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
     parse_strategy: str = "unknown"
     confidence: float = 0.0
@@ -45,6 +47,13 @@ class ParsedDocument:
             for row in tbl:
                 parts.append(", ".join(str(c) for c in row))
         return "\n".join(parts)
+
+    def table_cell_confidence(self, table_idx: int, row_idx: int, col_idx: int) -> float:
+        """Return the confidence for a specific cell, or 1.0 if unavailable."""
+        try:
+            return self.cell_confidences[table_idx][row_idx][col_idx]
+        except (IndexError, TypeError):
+            return 1.0
 
 
 def _sniff_mime(path: str) -> str:

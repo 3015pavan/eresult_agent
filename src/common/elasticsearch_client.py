@@ -106,6 +106,47 @@ def ensure_index(index: str, mappings: dict | None = None) -> None:
         logger.debug("ensure_index(%s) failed: %s", index, exc)
 
 
+def ensure_email_index() -> None:
+    """Create the `emails` index with full-text + keyword mappings."""
+    ensure_index("emails", mappings={
+        "properties": {
+            "id":           {"type": "keyword"},
+            "subject":      {"type": "text", "analyzer": "standard"},
+            "from":         {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "body":         {"type": "text", "analyzer": "standard"},
+            "date":         {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+            "classification": {"type": "keyword"},
+            "snippet":      {"type": "text"},
+            "thread_id":    {"type": "keyword"},
+        }
+    })
+
+
+def search_emails(query: str, size: int = 20) -> list[dict]:
+    """
+    Full-text search across email subject, body, and sender fields.
+    Returns list of email dicts. Returns [] when ES unavailable.
+    """
+    try:
+        resp = es_client().search(
+            index="emails",
+            body={
+                "query": {
+                    "multi_match": {
+                        "query": query,
+                        "fields": ["subject^3", "from^2", "body", "snippet"],
+                        "fuzziness": "AUTO",
+                    }
+                },
+                "size": size,
+            },
+        )
+        return [hit["_source"] for hit in resp["hits"]["hits"]]
+    except Exception as exc:
+        logger.debug("search_emails failed: %s", exc)
+        return []
+
+
 # ── Null client for graceful degradation ─────────────────────────────────────
 
 class _NullES:

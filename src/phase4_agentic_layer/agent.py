@@ -167,7 +167,10 @@ class AcadExtractAgent:
 
             for attempt in range(self.MAX_RETRIES + 1):
                 try:
-                    step.result = execute_step(tool, resolved_args, memory=memory)
+                    execution = execute_step(tool, resolved_args, memory=step_results)
+                    step.result = execution.output
+                    step.error = execution.error
+                    step.elapsed_ms = execution.duration_ms
                     step_results[f"step_{i}"] = step.result
                     break
                 except Exception as exc:
@@ -180,7 +183,8 @@ class AcadExtractAgent:
                         # Non-fatal: continue to next step
                         break
 
-            step.elapsed_ms = (time.time() - step.started_at) * 1000
+            if not step.elapsed_ms:
+                step.elapsed_ms = (time.time() - step.started_at) * 1000
 
             # Store in episodic memory
             memory.store(

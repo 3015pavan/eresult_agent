@@ -1,0 +1,5 @@
+INFO:     Started server process [62352]
+INFO:     Waiting for application startup.
+Redis ping failed: Error 10061 connecting to localhost:6379. No connection could be made because the target machine actively refused it.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8013 (Press CTRL+C to quit)

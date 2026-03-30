@@ -12,52 +12,46 @@ class TestIntentParser:
     def test_usn_pattern_detection(self):
         """Test that USN patterns are detected as student_lookup."""
         from src.phase5_query_engine.intent_parser import IntentParser
-
-        with patch("src.phase5_query_engine.intent_parser.get_settings") as mock:
-            mock.return_value = MagicMock()
-            parser = IntentParser()
-            intent = parser._quick_pattern_match("Show results for 1BM21CS001")
-            assert intent == QueryIntent.STUDENT_LOOKUP
+        parser = IntentParser()
+        intent = parser._quick_pattern_match("Show results for 1BM21CS001")
+        assert intent == QueryIntent.STUDENT_LOOKUP
 
     def test_top_n_detection(self):
         """Test that top-N queries are detected."""
         from src.phase5_query_engine.intent_parser import IntentParser
-
-        with patch("src.phase5_query_engine.intent_parser.get_settings") as mock:
-            mock.return_value = MagicMock()
-            parser = IntentParser()
-            intent = parser._quick_pattern_match("Top 10 students by SGPA")
-            assert intent == QueryIntent.TOP_N
+        parser = IntentParser()
+        intent = parser._quick_pattern_match("Top 10 students by SGPA")
+        assert intent == QueryIntent.TOP_N
 
     def test_backlog_detection(self):
         """Test that backlog queries are detected."""
         from src.phase5_query_engine.intent_parser import IntentParser
-
-        with patch("src.phase5_query_engine.intent_parser.get_settings") as mock:
-            mock.return_value = MagicMock()
-            parser = IntentParser()
-            intent = parser._quick_pattern_match("Students with backlogs in CS")
-            assert intent == QueryIntent.BACKLOGS
+        parser = IntentParser()
+        intent = parser._quick_pattern_match("Students with backlogs in CS")
+        assert intent == QueryIntent.BACKLOGS
 
     def test_aggregation_detection(self):
         """Test that aggregation queries are detected."""
         from src.phase5_query_engine.intent_parser import IntentParser
+        parser = IntentParser()
+        intent = parser._quick_pattern_match("What is the average CGPA?")
+        assert intent == QueryIntent.AGGREGATION
 
-        with patch("src.phase5_query_engine.intent_parser.get_settings") as mock:
-            mock.return_value = MagicMock()
-            parser = IntentParser()
-            intent = parser._quick_pattern_match("What is the average CGPA?")
-            assert intent == QueryIntent.AGGREGATION
+    def test_four_char_dept_usn(self):
+        """Test that 4-char dept code USNs (AIML, CSBS) are detected."""
+        from src.phase5_query_engine.intent_parser import IntentParser
+        parser = IntentParser()
+        intent = parser._quick_pattern_match("Results for 1MS21AIML001")
+        assert intent == QueryIntent.STUDENT_LOOKUP
 
 
 class TestSQLGenerator:
     """Tests for the SQL generator."""
 
     @pytest.fixture
-    def generator(self, mock_settings):
-        with patch("src.phase5_query_engine.sql_generator.get_settings", return_value=mock_settings):
-            from src.phase5_query_engine.sql_generator import SQLGenerator
-            return SQLGenerator()
+    def generator(self):
+        from src.phase5_query_engine.sql_generator import SQLGenerator
+        return SQLGenerator()
 
     def test_student_lookup_by_usn(self, generator):
         """Test SQL generation for student lookup by USN."""

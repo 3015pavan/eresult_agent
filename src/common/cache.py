@@ -1,11 +1,15 @@
 """
-Redis cache layer.
+Cache layer with Redis-first behavior and in-memory fallback.
 
 Provides:
-  - SHA-256 exact-dedup for emails (SET with TTL)
-  - SimHash near-dedup (simple threshold comparison over stored hashes)
-  - Last-UID checkpoint per Gmail account
+  - SHA-256 exact dedup for emails
+  - SimHash near-dedup
+  - MinHash near-dedup
+  - Last-UID checkpoint per account
   - Pipeline state persistence
+
+When Redis is unavailable in local development, the cache transparently falls
+back to an in-memory store so the app can still operate end to end.
 """
 
 from __future__ import annotations
@@ -20,11 +24,11 @@ import redis as _redis_lib
 
 logger = logging.getLogger(__name__)
 
-# Key namespaces
 _NS_SHA256 = "dedup:sha256:"
 _NS_SIMHASH = "dedup:simhash:"
 _NS_CHECKPOINT = "checkpoint:last_uid:"
 _NS_PIPELINE = "pipeline:state"
+_NS_MINHASH = "dedup:minhash:"
 
 _DEFAULT_TTL_DAYS = 30
 
@@ -41,8 +45,12 @@ def _get_url() -> str:
 class RedisCache:
     """Redis-backed dedup, checkpoint, and pipeline-state store."""
 
+    _MINHASH_NUM_PERM = 128
+
     def __init__(self):
         self._client: Optional[_redis_lib.Redis] = None
+        self._memory_mode = False
+        self._memory_store: dict[str, str] = {}
 
     @property
     def r(self) -> _redis_lib.Redis:
@@ -52,19 +60,84 @@ class RedisCache:
             )
         return self._client
 
-    # ── Connectivity ──────────────────────────────────────────────────────────
+    @property
+    def backend_name(self) -> str:
+        return "memory" if self._memory_mode else "redis"
+
+    def _enable_memory_fallback(self, exc: Exception) -> None:
+        if not self._memory_mode:
+            logger.warning("Redis unavailable, switching to in-memory cache: %s", exc)
+        self._memory_mode = True
+
+    def _get(self, key: str) -> Optional[str]:
+        if self._memory_mode:
+            return self._memory_store.get(key)
+        try:
+            return self.r.get(key)
+        except _redis_lib.RedisError as exc:
+            self._enable_memory_fallback(exc)
+            return self._memory_store.get(key)
+
+    def _set(self, key: str, value: str) -> None:
+        if self._memory_mode:
+            self._memory_store[key] = value
+            return
+        try:
+            self.r.set(key, value)
+        except _redis_lib.RedisError as exc:
+            self._enable_memory_fallback(exc)
+            self._memory_store[key] = value
+
+    def _setex(self, key: str, ttl_seconds: int, value: str) -> None:
+        if self._memory_mode:
+            self._memory_store[key] = value
+            return
+        try:
+            self.r.setex(key, ttl_seconds, value)
+        except _redis_lib.RedisError as exc:
+            self._enable_memory_fallback(exc)
+            self._memory_store[key] = value
+
+    def _delete(self, key: str) -> None:
+        if self._memory_mode:
+            self._memory_store.pop(key, None)
+            return
+        try:
+            self.r.delete(key)
+        except _redis_lib.RedisError as exc:
+            self._enable_memory_fallback(exc)
+            self._memory_store.pop(key, None)
+
+    def _exists(self, key: str) -> bool:
+        if self._memory_mode:
+            return key in self._memory_store
+        try:
+            return bool(self.r.exists(key))
+        except _redis_lib.RedisError as exc:
+            self._enable_memory_fallback(exc)
+            return key in self._memory_store
+
+    def _scan_keys(self, prefix: str) -> list[str]:
+        pattern = f"{prefix}*"
+        if self._memory_mode:
+            return [k for k in self._memory_store if k.startswith(prefix)]
+        try:
+            return list(self.r.scan_iter(pattern))
+        except _redis_lib.RedisError as exc:
+            self._enable_memory_fallback(exc)
+            return [k for k in self._memory_store if k.startswith(prefix)]
 
     def ping(self) -> bool:
-        """Return True if Redis is reachable."""
+        """Return True if Redis is reachable or memory fallback is active."""
+        if self._memory_mode:
+            return True
         try:
             self.r.ping()
             logger.info("Redis connection OK (%s)", _get_url())
             return True
         except _redis_lib.RedisError as exc:
-            logger.error("Redis ping failed: %s", exc)
-            return False
-
-    # ── SHA-256 exact-dedup ───────────────────────────────────────────────────
+            self._enable_memory_fallback(exc)
+            return True
 
     @staticmethod
     def _email_sha256(message_id: str, sender: str, date: str, subject: str) -> str:
@@ -81,7 +154,7 @@ class RedisCache:
         sha256: Optional[str] = None,
     ) -> bool:
         key = _NS_SHA256 + (sha256 or self._email_sha256(message_id, sender, date, subject))
-        return bool(self.r.exists(key))
+        return self._exists(key)
 
     def mark_seen_sha256(
         self,
@@ -94,16 +167,10 @@ class RedisCache:
         ttl_days: int = _DEFAULT_TTL_DAYS,
     ) -> None:
         key = _NS_SHA256 + (sha256 or self._email_sha256(message_id, sender, date, subject))
-        self.r.setex(key, ttl_days * 86400, "1")
-
-    # ── SimHash near-dedup ────────────────────────────────────────────────────
+        self._setex(key, ttl_days * 86400, "1")
 
     @staticmethod
     def _simhash(text: str) -> int:
-        """
-        Minimal 64-bit SimHash implementation (no external dependencies).
-        Uses word shingles weighted by sub-hash bit positions.
-        """
         v = [0] * 64
         words = text.lower().split()
         for word in words:
@@ -120,17 +187,11 @@ class RedisCache:
     def _hamming_distance(a: int, b: int) -> int:
         return bin(a ^ b).count("1")
 
-    def is_duplicate_simhash(
-        self, text: str, threshold: float = 0.9
-    ) -> bool:
-        """
-        Return True if any stored SimHash is within (1-threshold)*64 bits of *text*.
-        Scans stored hashes — only practical for small-to-medium volumes (< 100k emails).
-        """
+    def is_duplicate_simhash(self, text: str, threshold: float = 0.92) -> bool:
         new_hash = self._simhash(text)
         max_distance = int((1 - threshold) * 64)
-        for key in self.r.scan_iter(f"{_NS_SIMHASH}*"):
-            stored = int(self.r.get(key) or "0")
+        for key in self._scan_keys(_NS_SIMHASH):
+            stored = int(self._get(key) or "0")
             if self._hamming_distance(new_hash, stored) <= max_distance:
                 return True
         return False
@@ -139,20 +200,16 @@ class RedisCache:
         self, text: str, key_suffix: str, ttl_days: int = _DEFAULT_TTL_DAYS
     ) -> None:
         h = self._simhash(text)
-        self.r.setex(f"{_NS_SIMHASH}{key_suffix}", ttl_days * 86400, str(h))
-
-    # ── Last-UID checkpoint ───────────────────────────────────────────────────
+        self._setex(f"{_NS_SIMHASH}{key_suffix}", ttl_days * 86400, str(h))
 
     def get_checkpoint(self, account_id: str) -> Optional[str]:
-        return self.r.get(f"{_NS_CHECKPOINT}{account_id}")
+        return self._get(f"{_NS_CHECKPOINT}{account_id}")
 
     def set_checkpoint(self, account_id: str, uid: str) -> None:
-        self.r.set(f"{_NS_CHECKPOINT}{account_id}", uid)
-
-    # ── Pipeline state ────────────────────────────────────────────────────────
+        self._set(f"{_NS_CHECKPOINT}{account_id}", uid)
 
     def get_pipeline_state(self) -> dict:
-        raw = self.r.get(_NS_PIPELINE)
+        raw = self._get(_NS_PIPELINE)
         if raw:
             try:
                 return json.loads(raw)
@@ -161,37 +218,25 @@ class RedisCache:
         return {}
 
     def set_pipeline_state(self, state: dict) -> None:
-        self.r.set(_NS_PIPELINE, json.dumps(state, default=str))
+        self._set(_NS_PIPELINE, json.dumps(state, default=str))
 
     def clear_pipeline_state(self) -> None:
-        self.r.delete(_NS_PIPELINE)
-
-
-    # ── MinHash LSH near-dedup ────────────────────────────────────────────────
-
-    _NS_MINHASH = "dedup:minhash:"
-    _MINHASH_NUM_PERM = 128
+        self._delete(_NS_PIPELINE)
 
     @staticmethod
     def _shingles(text: str, k: int = 3) -> set[str]:
-        """Return k-character shingles from lowercased text."""
         t = text.lower()
         return {t[i: i + k] for i in range(len(t) - k + 1)} if len(t) >= k else {t}
 
     def is_duplicate_minhash(
         self, text: str, threshold: float = 0.85, key_suffix: str = ""
     ) -> bool:
-        """
-        Return True if stored MinHash signatures indicate Jaccard similarity ≥ threshold.
-        Stores candidate signatures in Redis as JSON arrays.
-        Falls back to False on any error (never blocks ingestion).
-        """
         try:
             import json as _j
+
             new_sig = self._compute_minhash(text)
-            scan_pattern = f"{self._NS_MINHASH}*"
-            for key in self.r.scan_iter(scan_pattern, count=500):
-                raw = self.r.get(key)
+            for key in self._scan_keys(_NS_MINHASH):
+                raw = self._get(key)
                 if not raw:
                     continue
                 stored_sig = _j.loads(raw)
@@ -208,12 +253,12 @@ class RedisCache:
         key_suffix: str,
         ttl_days: int = _DEFAULT_TTL_DAYS,
     ) -> None:
-        """Store MinHash signature for *text* under *key_suffix*."""
         try:
             import json as _j
+
             sig = self._compute_minhash(text)
-            self.r.setex(
-                f"{self._NS_MINHASH}{key_suffix}",
+            self._setex(
+                f"{_NS_MINHASH}{key_suffix}",
                 ttl_days * 86400,
                 _j.dumps(sig),
             )
@@ -221,21 +266,15 @@ class RedisCache:
             logger.debug("mark_seen_minhash error: %s", exc)
 
     def _compute_minhash(self, text: str) -> list[int]:
-        """
-        Compute MinHash signature of *text*.
-        Uses `datasketch` when available, otherwise falls back to a pure-Python
-        implementation with random hash functions seeded by shingle hashes.
-        """
         shingles = self._shingles(text)
         try:
             from datasketch import MinHash
+
             mh = MinHash(num_perm=self._MINHASH_NUM_PERM)
             for s in shingles:
                 mh.update(s.encode())
             return [int(v) for v in mh.hashvalues]
         except ImportError:
-            # Pure-Python fallback
-            import struct
             sig = []
             for seed in range(self._MINHASH_NUM_PERM):
                 min_h = float("inf")
@@ -254,8 +293,6 @@ class RedisCache:
         return matches / len(sig_a)
 
 
-# ── Singleton helper ─────────────────────────────────────────────────────────
-
 _cache: Optional[RedisCache] = None
 
 
@@ -266,10 +303,7 @@ def get_cache() -> RedisCache:
     return _cache
 
 
-# ── Module-level convenience wrappers ─────────────────────────────────────────
-
 def is_duplicate_sha256(sha256: str) -> bool:
-    """Check SHA-256 exact duplicate (module-level wrapper)."""
     try:
         return get_cache().is_duplicate_sha256("", sha256=sha256)
     except Exception:
@@ -277,7 +311,6 @@ def is_duplicate_sha256(sha256: str) -> bool:
 
 
 def mark_seen_sha256(sha256: str) -> None:
-    """Mark SHA-256 hash as seen (module-level wrapper)."""
     try:
         get_cache().mark_seen_sha256("", sha256=sha256)
     except Exception:
@@ -285,7 +318,6 @@ def mark_seen_sha256(sha256: str) -> None:
 
 
 def is_duplicate_minhash(text: str, threshold: float = 0.85) -> bool:
-    """Check MinHash near-duplicate (module-level wrapper)."""
     try:
         return get_cache().is_duplicate_minhash(text, threshold)
     except Exception:
@@ -293,7 +325,6 @@ def is_duplicate_minhash(text: str, threshold: float = 0.85) -> bool:
 
 
 def mark_seen_minhash(text: str, key_suffix: str) -> None:
-    """Store MinHash signature (module-level wrapper)."""
     try:
         get_cache().mark_seen_minhash(text, key_suffix)
     except Exception:

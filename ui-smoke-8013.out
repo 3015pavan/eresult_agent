@@ -1,0 +1,4 @@
+{"module": "src.api.app", "environment": "development", "event": "application_starting", "level": "info", "timestamp": "2026-03-24T18:37:18.957689Z"}
+{"module": "src.api.app", "event": "postgresql_ready", "level": "info", "timestamp": "2026-03-24T18:37:19.052576Z"}
+{"module": "src.api.app", "error": "HTTPConnectionPool(host='localhost', port=9000): Max retries exceeded with url: /emails-raw?location= (Caused by NewConnectionError(\"HTTPConnection(host='localhost', port=9000): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it\"))", "event": "minio_init_failed", "level": "warning", "timestamp": "2026-03-24T18:37:49.445287Z"}
+{"module": "src.api.app", "event": "redis_unreachable", "level": "warning", "timestamp": "2026-03-24T18:37:53.500765Z"}

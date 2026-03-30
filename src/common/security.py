@@ -11,10 +11,40 @@ import logging
 import os
 from typing import Optional
 
+from fastapi import Header, HTTPException
+
+from src.common.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 _CLAMD_HOST = os.getenv("CLAMD_HOST", "localhost")
 _CLAMD_PORT = int(os.getenv("CLAMD_PORT", "3310"))
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        return ""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return token.strip()
+
+
+def require_operator_access(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> None:
+    """Protect sensitive routes when APP_API_KEY is configured."""
+    expected = (get_settings().security.app_api_key or "").strip()
+    if not expected:
+        return
+
+    provided = (x_api_key or "").strip() or _extract_bearer_token(authorization)
+    if provided != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid API key for protected route.",
+        )
 
 
 class ScanResult:

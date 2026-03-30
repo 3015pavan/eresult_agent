@@ -5,8 +5,8 @@ Accepts and validates inbound email notifications from:
   - Generic SMTP relay (Mailgun, SendGrid, Postmark)
   - Microsoft Graph change notifications
 
-Received emails are logged. Integrate an email queue consumer here
-to enable automated processing of inbound webhooks.
+Received emails are validated then dispatched to the Celery extraction queue.
+If the Celery worker is unavailable the webhook still returns 200 (fail-open).
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
@@ -24,6 +25,8 @@ from src.common.observability import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+_MSGRAPH_MSG_ID_RE = re.compile(r"Messages/([^/]+)$", re.IGNORECASE)
 
 
 # ── HMAC signature validation ────────────────────────────────────────────────
@@ -38,6 +41,24 @@ def _verify_hmac(body: bytes, signature: str | None, secret: str) -> bool:
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, received_hex)
+
+
+def _dispatch_to_queue(message_id: str, institution_id: str | None = None) -> bool:
+    """
+    Dispatch a message to the Celery extraction queue.
+    Returns False (and logs a warning) if Celery worker is unavailable.
+    """
+    try:
+        from src.tasks.ingestion import ingest_single_email
+        ingest_single_email.apply_async(
+            kwargs={"message_id": message_id, "institution_id": institution_id},
+            queue="email_ingestion",
+        )
+        logger.info("webhook_dispatched_to_queue", message_id=message_id)
+        return True
+    except Exception as exc:
+        logger.warning("webhook_queue_dispatch_failed", message_id=message_id, error=str(exc))
+        return False
 
 
 # ── 1. Generic SMTP relay webhook ────────────────────────────────────────────
@@ -57,9 +78,22 @@ async def inbound_email_webhook(
         logger.warning("webhook_invalid_signature", content_length=len(body))
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-    logger.info("webhook_email_received", size_bytes=len(body))
-    # TODO: push to processing queue when a consumer is available
-    return {"status": "accepted", "size_bytes": len(body)}
+    # Extract Message-ID from MIME headers
+    message_id: str | None = None
+    try:
+        import email as _email_lib
+        msg = _email_lib.message_from_bytes(body)
+        message_id = (msg.get("Message-ID") or "").strip("<> ")
+    except Exception:
+        pass
+
+    if not message_id:
+        # Fallback: hash the body
+        message_id = hashlib.sha256(body).hexdigest()
+
+    logger.info("webhook_email_received", size_bytes=len(body), message_id=message_id)
+    queued = _dispatch_to_queue(message_id)
+    return {"status": "accepted", "size_bytes": str(len(body)), "queued": str(queued)}
 
 
 # ── 2. Microsoft Graph change notification ───────────────────────────────────
@@ -82,9 +116,18 @@ async def msgraph_notification(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    queued_count = 0
     for notification in payload.get("value", []):
         resource = notification.get("resource", "")
         logger.info("msgraph_notification_received", resource=resource)
-        # TODO: fetch and queue message when a consumer is available
 
-    return {"status": "accepted"}
+        # Extract message ID from resource path e.g. "Users/{id}/Messages/{msgId}"
+        m = _MSGRAPH_MSG_ID_RE.search(resource)
+        if m:
+            message_id = m.group(1)
+            if _dispatch_to_queue(message_id):
+                queued_count += 1
+        else:
+            logger.warning("msgraph_no_message_id", resource=resource)
+
+    return {"status": "accepted", "notifications": len(payload.get("value", [])), "queued": queued_count}

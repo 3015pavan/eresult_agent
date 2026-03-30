@@ -8,6 +8,11 @@ Provides REST endpoints for:
   - Webhook receivers for email notifications
 """
 
-from src.api.app import create_app
+
+def create_app():
+    """Lazy import to avoid module-level side-effects."""
+    from src.api.app import create_app as _create
+    return _create()
+
 
 __all__ = ["create_app"]

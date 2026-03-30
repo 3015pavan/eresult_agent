@@ -136,10 +136,11 @@ const App = {
       const sync = ss || {};
       const _v = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = (v != null && v !== '') ? String(v) : '—'; };
 
-      _v('pes-synced',   sync.total_cached ?? db.emails_processed ?? '—');
-      _v('pes-result',   db.result_emails  ?? '—');
-      _v('pes-records',  db.total_results  ?? '—');
-      _v('pes-students', db.total_students ?? '—');
+      _v('pes-email-files',    db.email_extractions  ?? '—');
+      _v('pes-admin-files',    db.admin_upload_files ?? '—');
+      _v('pes-email-students', db.email_students     ?? '—');
+      _v('pes-admin-students', db.admin_students     ?? '—');
+      _v('pes-total-students', db.total_students     ?? '—');
 
       // Last sync info row
       const acct = document.getElementById('psi-account');
@@ -182,14 +183,23 @@ const App = {
       if (log) log.scrollTop = log.scrollHeight;
       const newCount = data.records_extracted ?? 0;
       const skipCount = data.skipped_dedup ?? 0;
-      this.toast(
-        force
-          ? `Force reprocess done: ${newCount} record(s) extracted`
-          : newCount > 0
-            ? `Pipeline done: ${newCount} new record(s) extracted`
-            : `Pipeline done — ${skipCount} already stored. Use Force Reprocess to re-extract.`,
-        newCount > 0 ? 'success' : 'info'
-      );
+      if (data.async_mode) {
+        this.toast(
+          force
+            ? 'Force reprocess queued. Worker will process all cached emails shortly.'
+            : 'Pipeline queued successfully. Worker processing will start shortly.',
+          'success'
+        );
+      } else {
+        this.toast(
+          force
+            ? `Force reprocess done: ${newCount} record(s) extracted`
+            : newCount > 0
+              ? `Pipeline done: ${newCount} new record(s) extracted`
+              : `Pipeline done — ${skipCount} already stored. Use Force Reprocess to re-extract.`,
+          newCount > 0 ? 'success' : 'info'
+        );
+      }
       await this.loadStats();
       await this.loadPipelineStatus();
       this.loadPipelineSummary();
@@ -208,13 +218,16 @@ const App = {
       const p = data.pipeline || {};
       const db = data.database || {};
       const _set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v ?? '—'; };
-      _set('ps-emails',   this.formatNum(db.emails_processed   ?? 0));
-      _set('ps-students', this.formatNum(db.total_students     ?? 0));
-      _set('ps-records',  this.formatNum(db.total_results      ?? 0));
-      _set('ps-avgcgpa',  db.average_cgpa ? parseFloat(db.average_cgpa).toFixed(2) : '—');
-      _set('ps-backlogs', this.formatNum(db.total_backlogs     ?? 0));
-      _set('ps-agent',    p.status ?? '—');
-      _set('ps-avgtime',  p.last_run ? new Date(p.last_run).toLocaleString() : 'Never');
+      _set('ps-email-files',    this.formatNum(db.email_extractions  ?? 0));
+      _set('ps-admin-files',    this.formatNum(db.admin_upload_files ?? 0));
+      _set('ps-email-students', this.formatNum(db.email_students     ?? 0));
+      _set('ps-admin-students', this.formatNum(db.admin_students     ?? 0));
+      _set('ps-students',       this.formatNum(db.total_students     ?? 0));
+      _set('ps-records',        this.formatNum(db.total_results      ?? 0));
+      _set('ps-avgcgpa',        db.average_cgpa ? parseFloat(db.average_cgpa).toFixed(2) : '—');
+      _set('ps-backlogs',       this.formatNum(db.total_backlogs     ?? 0));
+      _set('ps-agent',          p.status ?? '—');
+      _set('ps-avgtime',        p.last_run ? new Date(p.last_run).toLocaleString() : 'Never');
     } catch (e) {
       // silently ignore
     }
@@ -252,10 +265,11 @@ const App = {
       const data = await this.apiGet('/api/v1/pipeline/status');
       const db = data.database || {};
       const _set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v ?? '—'; };
-      _set('stat-emails', this.formatNum(db.emails_processed || 0));
+      _set('stat-email-files', this.formatNum(db.email_extractions || 0));
+      _set('stat-admin-files', this.formatNum(db.admin_upload_files || 0));
+      _set('stat-email-students', this.formatNum(db.email_students || 0));
+      _set('stat-admin-students', this.formatNum(db.admin_students || 0));
       _set('stat-students', this.formatNum(db.total_students || 0));
-      _set('stat-results', this.formatNum(db.total_results || 0));
-      _set('stat-backlogs', this.formatNum(db.total_backlogs || 0));
       _set('stat-avgcgpa', db.average_cgpa ? parseFloat(db.average_cgpa).toFixed(2) : '—');
       _set('stat-extractions', this.formatNum(db.total_results || 0));
     } catch (e) {
@@ -374,19 +388,70 @@ const App = {
   // ── Student Lookup ──────────────────────────────────
   async lookupStudent() {
     const input = document.getElementById('student-usn-input');
-    const usn = input.value.trim().toUpperCase();
-    if (!usn) return;
+    const raw   = input.value.trim();
+    if (!raw) return;
 
     const btn = document.getElementById('student-submit');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Looking up...';
     document.getElementById('student-result').style.display = 'none';
 
+    const usnPattern = /^[1-4][A-Za-z]{2}\d{2}[A-Za-z]{2,4}\d{3}$/;
+    const usn = raw.toUpperCase();
+
     try {
-      const [student, trend] = await Promise.all([
-        this.apiGet(`/api/v1/student/${usn}`),
-        this.apiGet(`/api/v1/student/${usn}/trend`).catch(() => null),
-      ]);
+      if (usnPattern.test(usn)) {
+        await this._loadStudentProfile(usn);
+      } else {
+        // Name-based: search first, then decide
+        const search = await this.apiGet(`/api/v1/students?q=${encodeURIComponent(raw)}&limit=10`);
+        const students = (search.students || []);
+        if (students.length === 0) {
+          this.toast(`No student found matching "${raw}"`, 'error');
+          return;
+        }
+        if (students.length === 1) {
+          input.value = students[0].usn;
+          await this._loadStudentProfile(students[0].usn);
+          return;
+        }
+        // Multiple matches — show disambiguation list
+        const list = students.map(s => `
+          <li style="cursor:pointer;padding:8px 4px;border-bottom:1px solid #353849;"
+              onclick="app.pickStudentByUsn('${s.usn}')">
+            <strong style="color:#4f8cff;">${s.usn}</strong>
+            <span style="margin-left:8px;">${s.full_name || s.name || ''}</span>
+            ${s.cgpa ? `<span style="color:#a0a3b1;margin-left:8px;">CGPA ${parseFloat(s.cgpa).toFixed(2)}</span>` : ''}
+          </li>`).join('');
+        const box = document.getElementById('student-result');
+        box.style.display = 'block';
+        box.innerHTML = `<div class="card"><div class="card-body">
+          <p style="margin:0 0 10px;color:#b0b3c1;">
+            <strong>${students.length}</strong> students match <em>"${raw}"</em> — select one:
+          </p>
+          <ul style="list-style:none;padding:0;margin:0;">${list}</ul>
+        </div></div>`;
+        this.toast(`${students.length} students found`, 'info');
+      }
+    } catch (e) {
+      this.toast('Student lookup failed: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg> Lookup`;
+    }
+  },
+
+  async pickStudentByUsn(usn) {
+    document.getElementById('student-usn-input').value = usn;
+    document.getElementById('student-result').style.display = 'none';
+    await this._loadStudentProfile(usn);
+  },
+
+  async _loadStudentProfile(usn) {
+    const [student, trend] = await Promise.all([
+      this.apiGet(`/api/v1/student/${usn}`),
+      this.apiGet(`/api/v1/student/${usn}/trend`).catch(() => null),
+    ]);
 
       // Profile fields
       document.getElementById('sp-usn').textContent = student.usn;
@@ -457,12 +522,6 @@ const App = {
 
       document.getElementById('student-result').style.display = 'block';
       this.toast(`Loaded profile for ${student.name}`, 'success');
-    } catch (e) {
-      this.toast('Student lookup failed: ' + e.message, 'error');
-    } finally {
-      btn.disabled = false;
-      btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg> Lookup`;
-    }
   },
 
   downloadReport(format) {
@@ -476,6 +535,46 @@ const App = {
     a.click();
     document.body.removeChild(a);
     this.toast(`Downloading ${format.toUpperCase()} report for ${usn}…`, 'success');
+  },
+
+  // ── Email Report ────────────────────────────────────
+  showEmailModal() {
+    const usn = (document.getElementById('sp-usn').textContent || '').trim();
+    if (!usn || usn === '—') return this.toast('Look up a student first', 'error');
+    const overlay = document.getElementById('email-modal-overlay');
+    overlay.style.display = 'flex';
+    document.getElementById('email-modal-recipient').value = '';
+    document.getElementById('email-modal-recipient').focus();
+  },
+
+  hideEmailModal() {
+    document.getElementById('email-modal-overlay').style.display = 'none';
+  },
+
+  async sendReport() {
+    const usn = (document.getElementById('sp-usn').textContent || '').trim();
+    const recipient = document.getElementById('email-modal-recipient').value.trim();
+    const format = document.getElementById('email-modal-format').value;
+
+    if (!recipient) return this.toast('Enter a recipient email', 'error');
+    if (!usn || usn === '—') return this.toast('Look up a student first', 'error');
+
+    const btn = document.getElementById('email-modal-send');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Sending…';
+
+    try {
+      const data = await this.apiPost(`/api/v1/student/${usn}/email-report`, {
+        usn, recipient, format,
+      });
+      this.toast(data.message || `Report emailed to ${recipient}`, 'success');
+      this.hideEmailModal();
+    } catch (e) {
+      this.toast('Email failed: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> Send`;
+    }
   },
 
   renderTrendChart(trendData) {
@@ -562,14 +661,20 @@ const App = {
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.detail || JSON.stringify(data));
       resultBox.style.display = 'block';
-      resultBox.className = 'result-box success';
-      resultBox.innerHTML = `<strong>✓ Upload processed</strong><br>
-        File: ${data.filename}<br>
-        Students upserted: ${data.students_upserted}<br>
-        Results stored: ${data.results_stored}<br>
-        Records parsed: ${data.records_parsed}<br>
-        ${ data.errors && data.errors.length ? '<span style="color:#ff9f43;">Warnings: ' + data.errors.join(', ') + '</span>' : '' }`;
-      this.toast(`Uploaded ${data.filename} — ${data.students_upserted} students stored`, 'success');
+      if (data.status === 'no_data') {
+        resultBox.className = 'result-box error';
+        resultBox.innerHTML = `<strong>No student records found</strong><br>File: ${data.filename}<br>${data.message || ''}`;
+        this.toast(`No records found in ${data.filename}`, 'error');
+      } else {
+        resultBox.className = 'result-box success';
+        resultBox.innerHTML = `<strong>✓ Upload processed</strong><br>
+          File: ${data.filename}<br>
+          Students upserted: ${data.students_upserted}<br>
+          Results stored: ${data.results_stored}<br>
+          Records parsed: ${data.records_parsed}<br>
+          ${ data.errors && data.errors.length ? '<span style="color:#ff9f43;">Warnings: ' + data.errors.join(', ') + '</span>' : '' }`;
+        this.toast(`Uploaded ${data.filename} — ${data.students_upserted} students stored`, 'success');
+      }
       this._uploadFile = null;
       document.getElementById('upload-file-name').textContent = '';
       document.getElementById('upload-submit-btn').disabled = true;
@@ -586,50 +691,83 @@ const App = {
     }
   },
 
-  // ── Admin: Ingestion ────────────────────────────────
-  async triggerIngestion() {
-    const maxEmails = parseInt(document.getElementById('ingest-max').value) || 50;
-    const sinceHours = parseInt(document.getElementById('ingest-hours').value) || 24;
-    const resultBox = document.getElementById('ingest-result');
-
+  // ── Admin: Clear Seeded Data ────────────────────────
+  async clearSeeds() {
+    if (!confirm('Remove all seeded test data? Real extracted student data will be preserved.')) return;
+    const resultBox = document.getElementById('clear-seeds-result');
     try {
-      const data = await this.apiPost('/api/v1/admin/ingest', {
-        max_emails: maxEmails,
-        since_hours: sinceHours,
-      });
-      resultBox.style.display = 'block';
-      resultBox.className = 'result-box success';
-      resultBox.textContent = JSON.stringify(data, null, 2);
-      this.toast('Ingestion triggered', 'success');
+      const res = await fetch('/api/v1/pipeline/clear-seeds', { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      if (resultBox) {
+        resultBox.style.display = 'block';
+        resultBox.className = 'result-box success';
+        resultBox.textContent = `✓ Cleared ${data.seed_students_removed} seeded student(s) from the database.`;
+      }
+      this.toast(`Cleared ${data.seed_students_removed} seeded record(s)`, 'success');
+      await this.loadStats();
     } catch (e) {
-      resultBox.style.display = 'block';
-      resultBox.className = 'result-box error';
-      resultBox.textContent = e.message;
-      this.toast('Ingestion failed: ' + e.message, 'error');
+      if (resultBox) {
+        resultBox.style.display = 'block';
+        resultBox.className = 'result-box error';
+        resultBox.textContent = e.message;
+      }
+      this.toast('Clear failed: ' + e.message, 'error');
     }
   },
 
-  // ── Admin: Reprocess ────────────────────────────────
-  async reprocessDocument() {
-    const attachmentId = document.getElementById('reprocess-id').value.trim();
-    if (!attachmentId) return this.toast('Enter an attachment ID', 'error');
-    const force = document.getElementById('reprocess-force').checked;
-    const resultBox = document.getElementById('reprocess-result');
-
+  // ── Admin: Review Queue ─────────────────────────────
+  async loadReviewQueue() {
+    const status = document.getElementById('review-queue-status').value;
+    const listEl = document.getElementById('review-queue-list');
+    listEl.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px;">Loading...</p>';
     try {
-      const data = await this.apiPost('/api/v1/admin/reprocess', {
-        attachment_id: attachmentId,
-        force,
-      });
-      resultBox.style.display = 'block';
-      resultBox.className = 'result-box success';
-      resultBox.textContent = JSON.stringify(data, null, 2);
-      this.toast('Reprocessing started', 'success');
+      const data = await this.apiGet(`/api/v1/admin/review-queue?status=${status}&limit=50`);
+      if (!data.items || data.items.length === 0) {
+        listEl.innerHTML = `<p style="color:var(--text-muted);text-align:center;padding:20px;">No ${status} items.</p>`;
+        return;
+      }
+      listEl.innerHTML = data.items.map(item => `
+        <div class="result-box" style="margin-bottom:12px;padding:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+            <div>
+              <strong style="font-size:13px;">${item.email_subject || '(no subject)'}</strong>
+              <span style="font-size:11px;color:var(--text-muted);margin-left:8px;">${item.email_from || ''}</span>
+            </div>
+            <span style="font-size:11px;color:var(--text-muted);">Confidence: ${(parseFloat(item.confidence || 0) * 100).toFixed(0)}%</span>
+          </div>
+          ${item.validation_errors && item.validation_errors.length ? `<p style="font-size:11px;color:#e87;margin:0 0 8px;">${item.validation_errors.join(', ')}</p>` : ''}
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">ID: ${item.id} · ${item.created_at || ''}</div>
+          ${item.status === 'pending' ? `
+            <div style="display:flex;gap:8px;">
+              <button class="btn btn-primary btn-sm" onclick="App.approveReviewItem('${item.id}')">&#10003; Approve &amp; Save</button>
+              <button class="btn btn-danger btn-sm" onclick="App.rejectReviewItem('${item.id}')">&#10007; Reject</button>
+            </div>
+          ` : `<span style="font-size:12px;color:var(--text-muted);">Status: ${item.status}${item.notes ? ' &mdash; ' + item.notes : ''}</span>`}
+        </div>
+      `).join('');
     } catch (e) {
-      resultBox.style.display = 'block';
-      resultBox.className = 'result-box error';
-      resultBox.textContent = e.message;
-      this.toast('Reprocess failed: ' + e.message, 'error');
+      listEl.innerHTML = `<p style="color:#e87;">Error loading review queue: ${e.message}</p>`;
+    }
+  },
+
+  async approveReviewItem(itemId) {
+    try {
+      const data = await this.apiPost(`/api/v1/admin/review-queue/${itemId}/approve`, { save_to_db: true, notes: 'Approved via UI' });
+      this.toast(`Approved \u2014 ${data.records_saved} record(s) saved`, 'success');
+      await this.loadReviewQueue();
+    } catch (e) {
+      this.toast('Approve failed: ' + e.message, 'error');
+    }
+  },
+
+  async rejectReviewItem(itemId) {
+    try {
+      await this.apiPost(`/api/v1/admin/review-queue/${itemId}/reject`, { notes: 'Rejected via UI' });
+      this.toast('Item rejected', 'success');
+      await this.loadReviewQueue();
+    } catch (e) {
+      this.toast('Reject failed: ' + e.message, 'error');
     }
   },
 
@@ -710,11 +848,19 @@ const App = {
       const extracted = result.records_extracted ?? 0;
       const students  = result.students_updated  ?? 0;
 
-      setBanner('✓',
-        `Connected &amp; ready — synced ${synced} email${synced !== 1 ? 's' : ''}, extracted ${extracted} record${extracted !== 1 ? 's' : ''}${students ? `, updated ${students} student${students !== 1 ? 's' : ''}` : ''}.`,
-        'done'
-      );
-      this.toast(`Pipeline complete — ${extracted} records extracted`, 'success');
+      if (result.async_mode) {
+        setBanner('✓',
+          `Connected &amp; ready — synced ${synced} email${synced !== 1 ? 's' : ''}, and queued the pipeline worker successfully.`,
+          'done'
+        );
+        this.toast('Pipeline queued successfully', 'success');
+      } else {
+        setBanner('✓',
+          `Connected &amp; ready — synced ${synced} email${synced !== 1 ? 's' : ''}, extracted ${extracted} record${extracted !== 1 ? 's' : ''}${students ? `, updated ${students} student${students !== 1 ? 's' : ''}` : ''}.`,
+          'done'
+        );
+        this.toast(`Pipeline complete — ${extracted} records extracted`, 'success');
+      }
       this.loadStats();
       this.loadPipelineStatus();
 
@@ -752,12 +898,16 @@ const App = {
       const result = await this.apiPost('/api/v1/pipeline/run', {});
       const extracted = result.records_extracted ?? 0;
       const resultEmails = result.result_emails ?? 0;
-      this.toast(
-        extracted > 0
-          ? `Pipeline done — ${resultEmails} result email${resultEmails !== 1 ? 's' : ''}, ${extracted} record${extracted !== 1 ? 's' : ''} extracted`
-          : `Pipeline done — no new result emails found`,
-        extracted > 0 ? 'success' : 'info'
-      );
+      if (result.async_mode) {
+        this.toast('Pipeline queued successfully for background processing', 'success');
+      } else {
+        this.toast(
+          extracted > 0
+            ? `Pipeline done — ${resultEmails} result email${resultEmails !== 1 ? 's' : ''}, ${extracted} record${extracted !== 1 ? 's' : ''} extracted`
+            : `Pipeline done — no new result emails found`,
+          extracted > 0 ? 'success' : 'info'
+        );
+      }
       this.loadStats();
       this.loadPipelineStatus();
       this.loadPipelineSummary();

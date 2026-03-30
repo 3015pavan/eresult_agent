@@ -102,7 +102,7 @@ def main():
                 # Vary marks slightly per subject around the semester SGPA
                 random.seed(hash(usn + subj_code))
                 variation = random.uniform(-0.5, 0.5)
-                subj_gp = max(0.0, min(10.0, sgpa + variation)) if sgpa > 0 else 0.0
+                subj_gp = max(0.0, min(9.9, sgpa + variation)) if sgpa > 0 else 0.0
 
                 marks, grade, status = gp_to_marks(subj_gp)
                 if status == "FAIL":
@@ -116,7 +116,7 @@ def main():
                     marks_obtained=float(marks),
                     max_marks=100.0,
                     grade=grade,
-                    grade_points=subj_gp if sgpa > 0 else 0.0,
+                    grade_points=round(subj_gp if sgpa > 0 else 0.0, 1),
                     status=status,
                     exam_type="regular",
                 )
@@ -147,4 +147,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if '--remove' in sys.argv:
+        print("Removing seeded test data …")
+        db.init_db()
+        db.remove_seeded_students()
+    else:
+        main()

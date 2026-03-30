@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import base64
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -357,3 +356,116 @@ async def sync_status() -> dict:
         "total_cached": state.get("total_cached", len(_load_cache())),
         "fetched_last_run": state.get("fetched", 0),
     }
+
+
+# ── Thread Reconstruction ────────────────────────────────────────────
+
+
+def _build_thread_tree(emails: list[dict]) -> list[dict]:
+    """
+    Group emails into conversation threads using Message-ID/In-Reply-To/References headers.
+
+    Returns a list of root messages, each with a `replies` key containing
+    their direct children recursively.
+    """
+    # Index all emails by their Message-ID header for O(1) parent lookup
+    by_msg_id: dict[str, dict] = {}
+    for e in emails:
+        mid = e.get("message_id") or e.get("id", "")
+        if mid:
+            by_msg_id[mid] = {**e, "replies": []}
+
+    roots: list[dict] = []
+
+    for e in emails:
+        mid = e.get("message_id") or e.get("id", "")
+        if not mid or mid not in by_msg_id:
+            continue
+        node = by_msg_id[mid]
+
+        # Try In-Reply-To first, then last entry of References
+        parent_id = e.get("in_reply_to", "")
+        if not parent_id:
+            refs = e.get("references", [])
+            parent_id = refs[-1] if refs else ""
+
+        if parent_id and parent_id in by_msg_id:
+            by_msg_id[parent_id]["replies"].append(node)
+        else:
+            # No recognised parent → this is a root message
+            roots.append(node)
+
+    # Sort roots and replies by date descending (newest first)
+    def _sort_key(n: dict) -> str:
+        return n.get("date", "")
+
+    roots.sort(key=_sort_key, reverse=True)
+    for node in by_msg_id.values():
+        node["replies"].sort(key=_sort_key)
+
+    return roots
+
+
+@router.get("/sync/threads")
+async def get_threads(limit: int = 20, q: str = "") -> dict:
+    """
+    Return cached emails grouped into conversation threads.
+
+    Each thread root contains a `replies` list of direct children
+    (recursively). Useful for reviewing related result emails together.
+    """
+    emails = _load_cache()
+
+    # Optional text filter before threading
+    if q:
+        ql = q.lower()
+        emails = [
+            e for e in emails
+            if ql in e.get("subject", "").lower()
+            or ql in e.get("from", "").lower()
+            or ql in e.get("body", "").lower()
+        ]
+
+    threads = _build_thread_tree(emails)
+    return {
+        "total_threads": len(threads),
+        "total_emails": len(emails),
+        "threads": threads[:limit],
+    }
+
+
+# ── IMAP Sync ────────────────────────────────────────────────────────
+
+
+class ImapSyncRequest(BaseModel):
+    account_id: str
+    institution_id: str = ""
+
+
+@router.post("/sync/imap")
+async def trigger_imap_sync(req: ImapSyncRequest) -> dict:
+    """
+    Trigger IMAP inbox sync for a configured IMAP account.
+    Dispatches a Celery `sync_imap_inbox` task for the given account_id.
+    Falls back to synchronous fetch if Celery is unavailable.
+    """
+    institution_id = req.institution_id or None
+    try:
+        from src.tasks.ingestion import sync_imap_inbox
+        task = sync_imap_inbox.apply_async(
+            kwargs={"account_id": req.account_id, "institution_id": institution_id},
+            queue="email_ingestion",
+        )
+        return {
+            "status": "enqueued",
+            "task_id": task.id,
+            "account_id": req.account_id,
+        }
+    except Exception:
+        # Celery unavailable — run synchronously
+        try:
+            from src.tasks.ingestion import sync_imap_inbox
+            result = sync_imap_inbox(req.account_id, institution_id)
+            return {**result, "mode": "sync"}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"IMAP sync failed: {exc}")

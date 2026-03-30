@@ -1,7 +1,7 @@
 """
 Tool Registry — Phase 4.
 
-Defines 15 tools the agent can call to accomplish tasks.
+Defines 17 tools the agent can call to accomplish tasks.
 Each tool is a callable with a documented schema.
 """
 
@@ -236,9 +236,37 @@ def _tool_query_db(sql: str = "") -> dict:
 def _tool_send_notification(
     recipient: str = "", subject: str = "", message: str = ""
 ) -> dict:
-    """Send an email notification (stub — logs only in dev mode)."""
-    logger.info("notification: to=%s subject=%s", recipient, subject[:50])
-    return {"sent": True, "to": recipient}
+    """Send an email notification via SMTP."""
+    if not recipient or not subject:
+        return {"sent": False, "error": "recipient and subject required"}
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from src.common.config import get_settings
+
+        cfg = get_settings().smtp
+        if not cfg.configured:
+            logger.warning("smtp_not_configured: notification logged only")
+            return {"sent": False, "error": "SMTP not configured"}
+
+        msg = MIMEMultipart()
+        msg["From"] = f"{cfg.from_name} <{cfg.user}>"
+        msg["To"] = recipient
+        msg["Subject"] = subject
+        msg.attach(MIMEText(message, "html"))
+
+        with smtplib.SMTP(cfg.host, cfg.port, timeout=30) as server:
+            if cfg.use_tls:
+                server.starttls()
+            server.login(cfg.user, cfg.password)
+            server.send_message(msg)
+
+        logger.info("notification_sent: to=%s subject=%s", recipient, subject[:50])
+        return {"sent": True, "to": recipient}
+    except Exception as exc:
+        logger.error("notification_failed: to=%s error=%s", recipient, str(exc))
+        return {"sent": False, "error": str(exc)}
 
 
 def _tool_enqueue_review(email_id: str = "", records: list = None, confidence: float = 0.5) -> dict:

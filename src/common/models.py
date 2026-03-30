@@ -7,7 +7,6 @@ preventing malformed data from propagating downstream.
 
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -75,6 +74,11 @@ class ProcessingStatus(str, Enum):
 
 
 class QueryIntent(str, Enum):
+    STUDENT_LOOKUP = "student_lookup"
+    TOP_N = "top_n"
+    BACKLOGS = "backlogs"
+    AGGREGATION = "aggregation"
+    COUNT = "count"
     STUDENT_GPA = "student_gpa"
     STUDENT_CGPA = "student_cgpa"
     SEMESTER_PERFORMANCE = "semester_performance"
@@ -258,6 +262,7 @@ class ParsedQuery(BaseModel):
     raw_query: str
     intent: QueryIntent
     entities: dict[str, Any] = Field(default_factory=dict)
+    filters: dict[str, Any] = Field(default_factory=dict)
     # Resolved entities
     student_usn: str | None = None
     student_name: str | None = None

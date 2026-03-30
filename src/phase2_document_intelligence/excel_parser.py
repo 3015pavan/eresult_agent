@@ -13,7 +13,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from typing import Optional
 
 from .router import ParsedDocument
 
@@ -104,6 +103,38 @@ def _tables_to_text(tables: list[list[list[str]]]) -> str:
     return "\n".join(parts)
 
 
+def _compute_cell_confidences(tables: list[list[list[str]]]) -> list[list[list[float]]]:
+    """
+    Compute per-cell confidence scores for extracted table data.
+
+    Heuristics:
+      - Non-empty numeric value → 0.97
+      - Non-empty string (likely name/code) → 0.92
+      - Very short (< 2 chars) non-empty string → 0.80
+      - Empty cell → 0.50
+    """
+    import re
+    _numeric = re.compile(r"^-?\d+(\.\d+)?$")
+    result = []
+    for tbl in tables:
+        tbl_conf = []
+        for row in tbl:
+            row_conf = []
+            for cell in row:
+                val = str(cell).strip()
+                if not val or val in ("nan", "None", "-", ""):
+                    row_conf.append(0.50)
+                elif _numeric.match(val):
+                    row_conf.append(0.97)
+                elif len(val) < 2:
+                    row_conf.append(0.80)
+                else:
+                    row_conf.append(0.92)
+            tbl_conf.append(row_conf)
+        result.append(tbl_conf)
+    return result
+
+
 def parse_spreadsheet(path: str, mime_type: str = "") -> ParsedDocument:
     """
     Parse Excel or CSV file.
@@ -130,12 +161,14 @@ def parse_spreadsheet(path: str, mime_type: str = "") -> ParsedDocument:
     total_rows = sum(len(t) for t in tables)
     text = _tables_to_text(tables)
     confidence = min(0.95, 0.70 + total_rows * 0.002)
+    cell_confidences = _compute_cell_confidences(tables)
 
     return ParsedDocument(
         source_path=path,
         mime_type=mime_type or f"application/{ext}",
         text=text,
         tables=tables,
+        cell_confidences=cell_confidences,
         parse_strategy=strategy,
         confidence=confidence,
         metadata={"sheets": len(tables), "total_rows": total_rows},

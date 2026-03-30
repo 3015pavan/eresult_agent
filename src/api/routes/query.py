@@ -40,6 +40,7 @@ class QueryResponse(BaseModel):
     chart_spec: dict[str, Any] | None = None
     confidence: float
     caveats: list[str] = []
+    sources: list[str] = []   # USNs or record identifiers cited in the answer
 
 
 class StudentSummary(BaseModel):
@@ -78,13 +79,182 @@ def _student_display_name(s: dict) -> str:
     return s.get("full_name") or s.get("name") or s.get("usn") or ""
 
 
+def _compute_report_metrics(results: list[dict[str, Any]], sems: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build deterministic summary metrics from stored student results."""
+    total_scored = 0.0
+    total_max = 0.0
+    passed = 0
+    failed = 0
+    semesters = sorted(
+        {
+            int(row.get("semester"))
+            for row in results
+            if row.get("semester") is not None
+        }
+    )
+
+    for row in results:
+        try:
+            marks = row.get("marks_obtained")
+            max_marks = row.get("max_marks")
+            if marks is not None and max_marks is not None:
+                total_scored += float(marks)
+                total_max += float(max_marks)
+        except (TypeError, ValueError):
+            pass
+
+        status = str(row.get("pass_status") or "").upper()
+        if status == "PASS":
+            passed += 1
+        elif status == "FAIL":
+            failed += 1
+
+    best_sgpa = 0.0
+    for sem in sems:
+        try:
+            best_sgpa = max(best_sgpa, float(sem.get("sgpa") or 0.0))
+        except (TypeError, ValueError):
+            continue
+
+    percentage = round((total_scored / total_max) * 100, 2) if total_max else 0.0
+    pass_rate = round((passed / (passed + failed)) * 100, 2) if (passed + failed) else 0.0
+
+    return {
+        "subjects_total": len(results),
+        "subjects_passed": passed,
+        "subjects_failed": failed,
+        "total_scored": round(total_scored, 2),
+        "total_max": round(total_max, 2),
+        "percentage": percentage,
+        "pass_rate": pass_rate,
+        "best_sgpa": round(best_sgpa, 2),
+        "semesters_completed": len(semesters),
+    }
+
+
+def _build_html_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, sems, results, metrics) -> str:
+    """Render the student report as an HTML template."""
+    by_sem: dict[int, list[dict[str, Any]]] = {}
+    for row in results:
+        by_sem.setdefault(int(row.get("semester", 0)), []).append(row)
+
+    sem_cards = []
+    for sem in sems:
+        sem_cards.append(
+            f"""
+            <div class="metric-card">
+              <div class="metric-label">Semester {sem.get('semester')}</div>
+              <div class="metric-value">{float(sem.get('sgpa') or 0):.2f}</div>
+              <div class="metric-sub">SGPA · Backlogs {int(sem.get('backlogs') or 0)}</div>
+            </div>
+            """
+        )
+
+    detail_sections = []
+    for sem_num in sorted(by_sem):
+        rows = []
+        for row in by_sem[sem_num]:
+            status = row.get("pass_status", "—") or "—"
+            rows.append(
+                f"""
+                <tr>
+                  <td>{row.get('subject_code', '')}</td>
+                  <td>{row.get('subject_name', '')}</td>
+                  <td>{int(row.get('marks_obtained', 0) or 0)}</td>
+                  <td>{int(row.get('max_marks', 100) or 100)}</td>
+                  <td>{row.get('grade', '—') or '—'}</td>
+                  <td class="{status.lower()}">{status}</td>
+                </tr>
+                """
+            )
+        detail_sections.append(
+            f"""
+            <section class="semester-section">
+              <h3>Semester {sem_num}</h3>
+              <table>
+                <thead>
+                  <tr><th>Code</th><th>Subject</th><th>Marks</th><th>Max</th><th>Grade</th><th>Status</th></tr>
+                </thead>
+                <tbody>
+                  {''.join(rows)}
+                </tbody>
+              </table>
+            </section>
+            """
+        )
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Academic Report - {usn}</title>
+      <style>
+        :root {{ --ink:#1a1d27; --muted:#677189; --accent:#1e5eff; --line:#d8ddea; --bg:#f6f8fc; --ok:#157347; --bad:#b42318; }}
+        * {{ box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, sans-serif; margin:0; color:var(--ink); background:linear-gradient(180deg,#ffffff,#f6f8fc); }}
+        .page {{ max-width: 980px; margin: 0 auto; padding: 32px; }}
+        .hero {{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:2px solid var(--line); padding-bottom:18px; margin-bottom:24px; }}
+        .brand {{ font-size:28px; font-weight:700; color:var(--accent); }}
+        .meta {{ color:var(--muted); font-size:13px; }}
+        .profile {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px 18px; background:#fff; border:1px solid var(--line); border-radius:16px; padding:20px; }}
+        .field-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+        .field-value {{ font-size:15px; font-weight:600; }}
+        .metrics {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:14px; margin:22px 0; }}
+        .metric-card {{ background:#fff; border:1px solid var(--line); border-radius:16px; padding:16px; }}
+        .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }}
+        .metric-value {{ font-size:24px; font-weight:700; margin-top:6px; }}
+        .metric-sub {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+        h2, h3 {{ margin:24px 0 12px; }}
+        table {{ width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
+        th, td {{ padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; font-size:13px; }}
+        th {{ background:#eef3ff; color:#244091; }}
+        td.pass {{ color:var(--ok); font-weight:700; }}
+        td.fail {{ color:var(--bad); font-weight:700; }}
+        .semester-section {{ margin-top:20px; }}
+      </style>
+    </head>
+    <body>
+      <div class="page">
+        <div class="hero">
+          <div>
+            <div class="brand">AcadExtract</div>
+            <div class="meta">Academic Report · Student Result Automation</div>
+          </div>
+          <div class="meta">USN {usn}</div>
+        </div>
+
+        <section class="profile">
+          <div><div class="field-label">Student</div><div class="field-value">{name}</div></div>
+          <div><div class="field-label">Email</div><div class="field-value">{email_str}</div></div>
+          <div><div class="field-label">Department</div><div class="field-value">{dept or '—'}</div></div>
+          <div><div class="field-label">Batch Year</div><div class="field-value">{batch_year or '—'}</div></div>
+          <div><div class="field-label">CGPA</div><div class="field-value">{cgpa:.2f}</div></div>
+          <div><div class="field-label">Backlogs</div><div class="field-value">{backlogs}</div></div>
+        </section>
+
+        <section class="metrics">
+          <div class="metric-card"><div class="metric-label">Overall Percentage</div><div class="metric-value">{metrics['percentage']:.2f}%</div><div class="metric-sub">{metrics['total_scored']:.0f} / {metrics['total_max']:.0f}</div></div>
+          <div class="metric-card"><div class="metric-label">Subjects Passed</div><div class="metric-value">{metrics['subjects_passed']} / {metrics['subjects_total']}</div><div class="metric-sub">Pass rate {metrics['pass_rate']:.2f}%</div></div>
+          <div class="metric-card"><div class="metric-label">Best SGPA</div><div class="metric-value">{metrics['best_sgpa']:.2f}</div><div class="metric-sub">{metrics['semesters_completed']} semester(s)</div></div>
+          {''.join(sem_cards)}
+        </section>
+
+        <h2>Detailed Results</h2>
+        {''.join(detail_sections) if detail_sections else '<p>No detailed results available.</p>'}
+      </div>
+    </body>
+    </html>
+    """
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 — intent parsing
 # ---------------------------------------------------------------------------
 
 def _parse_intent_local(query: str) -> dict[str, Any]:
     q = query.lower()
-    usn_m = re.search(r'\b[1-4][a-z]{2}\d{2}[a-z]{2,3}\d{3}\b', q, re.IGNORECASE)
+    usn_m = re.search(r'\b[1-4][a-z]{2}\d{2}[a-z]{2,4}\d{3}\b', q, re.IGNORECASE)
     usn   = usn_m.group(0).upper() if usn_m else None
     sem_m = re.search(r'\b(\d)\s*(st|nd|rd|th)?\s*sem', q)
     semester = int(sem_m.group(1)) if sem_m else None
@@ -165,8 +335,9 @@ def _execute_query(
                     SELECT usn, name AS full_name, total_backlogs, cgpa
                     FROM students
                     WHERE institution_id = %s AND total_backlogs > 0
-                    ORDER BY total_backlogs DESC LIMIT 50
-                """, (inst_id,))
+                                            {student_filter}
+                                        ORDER BY total_backlogs DESC LIMIT 50
+                                """.format(student_filter=db.student_source_filter(include_and=True)), (inst_id,))
                 data = [_serialise(dict(r)) for r in cur.fetchall()]
         if not data:
             return [], "", "No students with backlogs found."
@@ -199,8 +370,9 @@ def _execute_query(
                     SELECT usn, name AS full_name, cgpa, total_backlogs
                     FROM students
                     WHERE institution_id = %s AND cgpa > 0
-                    ORDER BY cgpa DESC LIMIT 10
-                """, (inst_id,))
+                                            {student_filter}
+                                        ORDER BY cgpa DESC LIMIT 10
+                                """.format(student_filter=db.student_source_filter(include_and=True)), (inst_id,))
                 data = [_serialise(dict(r)) for r in cur.fetchall()]
         if not data:
             return [], "", "No CGPA data yet. Run the pipeline first."
@@ -247,15 +419,40 @@ def _execute_query(
             text,
         )
 
-    # ── fallback: name search ────────────────────────────────────────────────
+    # ── fallback: name search — treat as student_lookup if exactly one match ─
     for word in [w for w in raw_query.split() if len(w) > 3]:
         matches = db.search_students(word, limit=5)
-        if matches:
+        if not matches:
+            continue
+        if len(matches) == 1:
+            # Single match → show full results, same as student_lookup
+            student = matches[0]
+            found_usn = student["usn"]
+            results = db.get_student_results(found_usn, semester)
+            name = _student_display_name(student)
+            if results:
+                passes = sum(1 for r in results if str(r.get("pass_status", "")).lower() == "pass")
+                fails  = sum(1 for r in results if str(r.get("pass_status", "")).lower() == "fail")
+                text   = f"Results for {name} (USN: {found_usn}): "
+                text  += f"{len(results)} subject(s), {passes} passed, {fails} failed."
+                if student.get("cgpa"):
+                    text += f" CGPA: {float(student['cgpa']):.2f}."
+                return (
+                    [_serialise(r) for r in results],
+                    f"SELECT * FROM student_results WHERE student_id = '{student['id']}'",
+                    text,
+                )
             return (
-                [_serialise(m) for m in matches],
-                f"SELECT * FROM students WHERE full_name ILIKE '%{word}%'",
-                f"Found {len(matches)} student(s) matching '{word}'.",
+                [_serialise(student)],
+                f"SELECT * FROM students WHERE usn = '{found_usn}'",
+                f"Found {name} (USN: {found_usn}) but no results stored yet.",
             )
+        # Multiple matches — list them
+        return (
+            [_serialise(m) for m in matches],
+            f"SELECT * FROM students WHERE name ILIKE '%{word}%'",
+            f"Found {len(matches)} student(s) matching '{word}'. Specify a USN for detailed results.",
+        )
 
     stats = db.get_pipeline_stats()
     return (
@@ -269,6 +466,123 @@ def _execute_query(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+def _llm_synthesize_query_answer(
+    query: str,
+    intent: str,
+    rows: list[dict],
+    template_answer: str,
+) -> tuple[str, list[str]]:
+    """
+    Use the configured LLM to produce a natural-language answer for a query.
+    Falls back to the template answer if no LLM is available or call fails.
+
+    Returns (answer_text, sources) where sources is a list of cited USNs/names.
+    """
+    # Extract source identifiers (USNs or names) from rows for citations
+    sources: list[str] = []
+    for r in rows[:20]:
+        identifier = r.get("usn") or r.get("full_name") or r.get("name")
+        if identifier and str(identifier) not in sources:
+            sources.append(str(identifier))
+
+    # Insufficient-data guard (applied before LLM call)
+    if not rows:
+        return (
+            "I don't have sufficient data to answer this question. "
+            "Please run the pipeline to import more results.",
+            [],
+        )
+
+    try:
+        from src.common.config import get_settings
+        settings = get_settings()
+        provider = settings.llm.active_provider
+        if provider == "none":
+            return template_answer, sources
+
+        # Build a compact context string from the data rows (cap at 20 rows)
+        context_parts = [f"Query: {query}", f"Intent: {intent}", f"Raw answer: {template_answer}"]
+        if rows:
+            context_parts.append(f"Data ({min(len(rows), 20)} of {len(rows)} record(s)):")
+            for r in rows[:20]:
+                context_parts.append("  " + "  |  ".join(
+                    f"{k}: {v}" for k, v in r.items()
+                    if v is not None and str(v) not in ("", "None")
+                ))
+
+        sources_str = ", ".join(sources[:10]) if sources else "none"
+        prompt = (
+            "You are AcadAssist, an AI assistant for teachers at MSRIT/VTU. "
+            "Given the following academic database query result, write a concise, "
+            "clear natural-language answer for the teacher. "
+            "Use markdown for emphasis where helpful. Be factual and precise. "
+            "IMPORTANT: Only state facts present in the provided data. "
+            "If you are uncertain or data is insufficient, say "
+            "'I don't have enough data to fully answer this question.' "
+            f"Cite specific students or records where relevant (available: {sources_str}).\n\n"
+            + "\n".join(context_parts)
+            + "\n\nAnswer:"
+        )
+
+        # Waterfall: try each provider in order until one succeeds
+        _synth_providers: list[str] = []
+        if settings.llm.groq_api_key:
+            _synth_providers.append("groq")
+        if settings.llm.primary_api_key:
+            _synth_providers.append("openai")
+        if settings.llm.secondary_api_key:
+            _synth_providers.append("gemini")
+
+        llm_answer = None
+        for _provider in _synth_providers:
+            try:
+                if _provider == "groq":
+                    from groq import Groq
+                    client = Groq(api_key=settings.llm.groq_api_key)
+                    completion = client.chat.completions.create(
+                        model=settings.llm.groq_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=512,
+                    )
+                    llm_answer = completion.choices[0].message.content.strip()
+                elif _provider == "openai":
+                    from openai import OpenAI
+                    client = OpenAI(api_key=settings.llm.primary_api_key)
+                    resp = client.chat.completions.create(
+                        model=settings.llm.primary_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=512,
+                    )
+                    llm_answer = resp.choices[0].message.content.strip()
+                elif _provider == "gemini":
+                    import google.generativeai as genai
+                    genai.configure(api_key=settings.llm.secondary_api_key)
+                    gmodel = genai.GenerativeModel(settings.llm.secondary_model)
+                    response = gmodel.generate_content(
+                        prompt,
+                        generation_config={"temperature": 0.2, "max_output_tokens": 512},
+                    )
+                    llm_answer = response.text.strip()
+                if llm_answer:
+                    break  # success
+            except Exception as _exc:
+                logger.warning("llm_query_synthesis_%s_failed: %s", _provider, _exc)
+
+        if llm_answer:
+            # Append sources footnote if we have identifiers
+            if sources:
+                sources_footnote = "\n\n---\n*Sources: " + ", ".join(sources[:10]) + "*"
+                llm_answer += sources_footnote
+            return llm_answer, sources
+
+    except Exception as exc:
+        logger.warning("llm_query_synthesis_failed", error=str(exc))
+
+    return template_answer, sources
+
+
 @router.post("/query", response_model=QueryResponse)
 async def submit_query(request: QueryRequest) -> QueryResponse:
     """Natural language academic query (Phase 5)."""
@@ -280,7 +594,11 @@ async def submit_query(request: QueryRequest) -> QueryResponse:
     usn      = parsed.get("usn")
     semester = parsed.get("semester")
 
-    rows, sql, text_answer = _execute_query(intent, usn, semester, request.query)
+    rows, sql, template_answer = _execute_query(intent, usn, semester, request.query)
+
+    # Upgrade template answer to natural-language via LLM (best-effort, non-blocking)
+    text_answer, sources = _llm_synthesize_query_answer(request.query, intent, rows, template_answer)
+
     elapsed  = int((time.perf_counter() - start) * 1000)
 
     chart_spec = None
@@ -317,6 +635,7 @@ async def submit_query(request: QueryRequest) -> QueryResponse:
         chart_spec=chart_spec,
         confidence=parsed.get("confidence", 0.75),
         caveats=(["No data found. Run the pipeline on synced emails."] if not rows else []),
+        sources=sources,
     )
 
 
@@ -357,9 +676,9 @@ async def get_student(usn: str) -> StudentSummary:
             cur.execute("""
                 SELECT COUNT(*) AS rnk FROM students
                 WHERE institution_id = %s
-                  AND (metadata->>'source' IS DISTINCT FROM 'seed')
+                {student_filter}
                   AND cgpa > %s
-            """, (inst_id, float(student.get("cgpa") or 0)))
+            """.format(student_filter=db.student_source_filter(include_and=True)), (inst_id, float(student.get("cgpa") or 0)))
             rnk_row = cur.fetchone()
             class_rank = int(rnk_row["rnk"]) + 1 if rnk_row else None
 
@@ -367,8 +686,8 @@ async def get_student(usn: str) -> StudentSummary:
             cur.execute("""
                 SELECT COUNT(*) AS cnt FROM students
                 WHERE institution_id = %s
-                  AND (metadata->>'source' IS DISTINCT FROM 'seed')
-            """, (inst_id,))
+                {student_filter}
+            """.format(student_filter=db.student_source_filter(include_and=True)), (inst_id,))
             total_students = int(cur.fetchone()["cnt"])
 
     # Group results by semester for easy frontend rendering
@@ -450,6 +769,7 @@ async def export_student_report(usn: str, format: str = "pdf"):
                 FROM semester_aggregates WHERE student_id = %s ORDER BY semester
             """, (sid,))
             sems = [dict(r) for r in cur.fetchall()]
+    metrics = _compute_report_metrics(all_results, sems)
 
     # Derive department + batch from USN
     u = student["usn"].upper()
@@ -464,12 +784,17 @@ async def export_student_report(usn: str, format: str = "pdf"):
     backlogs  = int(student.get("active_backlogs") or 0)
     email_str = student.get("email") or "—"
 
-    if format.lower() == "docx":
-        buf = _build_docx_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results)
+    fmt = format.lower()
+    if fmt == "docx":
+        buf = _build_docx_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results, metrics)
         fname = f"{u}_report.docx"
         media  = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif fmt == "xlsx":
+        buf = _build_xlsx_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results, metrics)
+        fname = f"{u}_report.xlsx"
+        media  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
-        buf = _build_pdf_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results)
+        buf = _build_pdf_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results, metrics)
         fname = f"{u}_report.pdf"
         media  = "application/pdf"
 
@@ -480,7 +805,143 @@ async def export_student_report(usn: str, format: str = "pdf"):
     )
 
 
-def _build_pdf_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, sems, results):
+# ---------------------------------------------------------------------------
+# Email report endpoint
+# ---------------------------------------------------------------------------
+
+class EmailReportRequest(BaseModel):
+    usn: str = Field(..., min_length=3, max_length=30)
+    recipient: str = Field(..., min_length=5, max_length=254)
+    format: str = Field(default="pdf")
+    subject: str | None = None
+
+
+class EmailReportResponse(BaseModel):
+    sent: bool
+    recipient: str
+    usn: str
+    message: str
+
+
+def _send_email_with_attachment(
+    to_addr: str, subject: str, body_html: str,
+    attachment_bytes: bytes, attachment_name: str, mime_type: str,
+) -> None:
+    """Send an email with a file attachment via SMTP."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+    from src.common.config import get_settings
+
+    cfg = get_settings().smtp
+    if not cfg.configured:
+        raise RuntimeError("SMTP not configured. Set SMTP_USER and SMTP_PASSWORD in .env")
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{cfg.from_name} <{cfg.user}>"
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_html, "html"))
+
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(attachment_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
+    msg.attach(part)
+
+    with smtplib.SMTP(cfg.host, cfg.port, timeout=30) as server:
+        if cfg.use_tls:
+            server.starttls()
+        server.login(cfg.user, cfg.password)
+        server.send_message(msg)
+
+
+@router.post("/student/{usn}/email-report", response_model=EmailReportResponse)
+async def email_student_report(usn: str, req: EmailReportRequest):
+    """Generate an academic report and email it to the specified recipient."""
+    # Validate email format
+    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', req.recipient):
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    db.init_db()
+    student = db.get_student(usn.upper())
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student {usn} not found")
+
+    sid = student["id"]
+    all_results = db.get_student_results(usn.upper())
+
+    with db.get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT semester, sgpa, credits_earned, subjects_passed, subjects_failed, backlogs
+                FROM semester_aggregates WHERE student_id = %s ORDER BY semester
+            """, (sid,))
+            sems = [dict(r) for r in cur.fetchall()]
+
+    u = student["usn"].upper()
+    try:
+        batch_year = 2000 + int(u[3:5])
+        department = u[5:7]
+    except Exception:
+        batch_year, department = None, ""
+
+    name      = _student_display_name(student)
+    cgpa      = float(student.get("cgpa") or 0)
+    backlogs  = int(student.get("active_backlogs") or 0)
+    email_str = student.get("email") or "—"
+
+    fmt = (req.format or "pdf").lower()
+    if fmt == "docx":
+        buf = _build_docx_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results, metrics)
+        fname = f"{u}_report.docx"
+        mime  = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif fmt == "xlsx":
+        buf = _build_xlsx_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results, metrics)
+        fname = f"{u}_report.xlsx"
+        mime  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        buf = _build_pdf_report(u, name, email_str, department, batch_year, cgpa, backlogs, sems, all_results, metrics)
+        fname = f"{u}_report.pdf"
+        mime  = "application/pdf"
+
+    subj = req.subject or f"Academic Report — {name} ({u})"
+    body_html = f"""
+    <div style="font-family:Arial,sans-serif;color:#1a1d27;">
+        <h2 style="color:#4f8cff;">AcadExtract — Academic Report</h2>
+        <p>Hello,</p>
+        <p>Please find attached the academic report for <strong>{name}</strong> (USN: {u}).</p>
+        <ul>
+            <li><strong>CGPA:</strong> {cgpa:.2f}</li>
+            <li><strong>Overall Percentage:</strong> {metrics['percentage']:.2f}%</li>
+            <li><strong>Subjects Passed:</strong> {metrics['subjects_passed']} / {metrics['subjects_total']}</li>
+            <li><strong>Active Backlogs:</strong> {backlogs}</li>
+            <li><strong>Department:</strong> {department or '—'}</li>
+        </ul>
+        <p>This report was generated automatically by AcadExtract.</p>
+        <hr style="border:none;border-top:1px solid #e4e6eb;">
+        <p style="font-size:12px;color:#8b8fa3;">AcadExtract — Autonomous Academic Result Extraction & Student Profiling</p>
+    </div>
+    """
+
+    try:
+        _send_email_with_attachment(req.recipient, subj, body_html, buf.read(), fname, mime)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error("email_send_failed", error=str(e), to=req.recipient, usn=u)
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+
+    logger.info("email_report_sent", to=req.recipient, usn=u, format=fmt)
+    return EmailReportResponse(
+        sent=True, recipient=req.recipient, usn=u,
+        message=f"Report emailed to {req.recipient}"
+    )
+
+
+def _build_pdf_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, sems, results, metrics):
     """Build a PDF academic report using ReportLab."""
     import io
     from datetime import date
@@ -526,6 +987,9 @@ def _build_pdf_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, se
         ["Department",    dept if dept else "—"],
         ["Batch Year",    str(batch_year) if batch_year else "—"],
         ["CGPA",          f"{cgpa:.2f}"],
+        ["Overall Percentage", f"{metrics['percentage']:.2f}%"],
+        ["Subjects Passed", f"{metrics['subjects_passed']} / {metrics['subjects_total']}"],
+        ["Best SGPA", f"{metrics['best_sgpa']:.2f}" if metrics["best_sgpa"] else "â€”"],
         ["Active Backlogs", str(backlogs)],
     ]
     pt = Table(profile_data, colWidths=[4*cm, W-4*cm])
@@ -613,16 +1077,154 @@ def _build_pdf_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, se
     return buf
 
 
-def _build_docx_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, sems, results):
+def _build_xlsx_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, sems, results, metrics):
+    """Build an Excel academic report using openpyxl."""
+    import io
+    from datetime import date
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+
+    # ── Colours & styles ────────────────────────────────────────────
+    accent_fill = PatternFill(start_color="4F8CFF", end_color="4F8CFF", fill_type="solid")
+    dark_fill   = PatternFill(start_color="1A1D27", end_color="1A1D27", fill_type="solid")
+    alt_fill    = PatternFill(start_color="F5F6FA", end_color="F5F6FA", fill_type="solid")
+    hdr_font    = Font(bold=True, color="FFFFFF", size=10)
+    title_font  = Font(bold=True, size=14, color="1A1D27")
+    sub_font    = Font(italic=True, size=9, color="8B8FA3")
+    label_font  = Font(bold=True, size=10, color="8B8FA3")
+    value_font  = Font(size=10, color="1A1D27")
+    fail_font   = Font(size=10, color="E55353", bold=True)
+    pass_font   = Font(size=10, color="2ECC71")
+    thin_border = Border(
+        left=Side(style="thin", color="CCCCCC"),
+        right=Side(style="thin", color="CCCCCC"),
+        top=Side(style="thin", color="CCCCCC"),
+        bottom=Side(style="thin", color="CCCCCC"),
+    )
+
+    # ── Summary sheet ───────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Summary"
+    ws.sheet_properties.tabColor = "4F8CFF"
+
+    ws.merge_cells("A1:F1")
+    ws["A1"].value = "AcadExtract — Academic Report"
+    ws["A1"].font = title_font
+    ws["A2"].value = f"Generated {date.today().strftime('%d %B %Y')}"
+    ws["A2"].font = sub_font
+
+    row = 4
+    profile = [
+        ("USN", usn), ("Name", name), ("Email", email_str),
+        ("Department", dept or "—"), ("Batch Year", str(batch_year) if batch_year else "—"),
+        ("CGPA", f"{cgpa:.2f}"), ("Overall Percentage", f"{metrics['percentage']:.2f}%"),
+        ("Subjects Passed", f"{metrics['subjects_passed']} / {metrics['subjects_total']}"),
+        ("Best SGPA", f"{metrics['best_sgpa']:.2f}" if metrics["best_sgpa"] else "â€”"),
+        ("Active Backlogs", str(backlogs)),
+    ]
+    for lbl, val in profile:
+        ws.cell(row=row, column=1, value=lbl).font = label_font
+        ws.cell(row=row, column=2, value=val).font = value_font
+        row += 1
+
+    # Semester summary table
+    if sems:
+        row += 1
+        ws.cell(row=row, column=1, value="Semester Summary").font = Font(bold=True, size=12, color="4F8CFF")
+        row += 1
+        sem_headers = ["Semester", "SGPA", "Credits Earned", "Passed", "Failed", "Backlogs"]
+        for c, h in enumerate(sem_headers, 1):
+            cell = ws.cell(row=row, column=c, value=h)
+            cell.font = hdr_font
+            cell.fill = accent_fill
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin_border
+        for s in sems:
+            row += 1
+            vals = [
+                s.get("semester", ""),
+                float(s["sgpa"]) if s.get("sgpa") else None,
+                s.get("credits_earned"),
+                s.get("subjects_passed"),
+                s.get("subjects_failed"),
+                s.get("backlogs", 0),
+            ]
+            for c, v in enumerate(vals, 1):
+                cell = ws.cell(row=row, column=c, value=v)
+                cell.font = value_font
+                cell.alignment = Alignment(horizontal="center")
+                cell.border = thin_border
+                if row % 2 == 0:
+                    cell.fill = alt_fill
+
+    # Auto-fit column widths
+    for col in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 30)
+
+    # ── Per-semester detail sheets ──────────────────────────────────
+    by_sem: dict[int, list] = {}
+    for r in results:
+        by_sem.setdefault(int(r.get("semester", 0)), []).append(r)
+
+    for sem_num in sorted(by_sem):
+        sheet = wb.create_sheet(title=f"Sem {sem_num}")
+        sheet.sheet_properties.tabColor = "4F8CFF"
+
+        sheet.merge_cells("A1:F1")
+        sheet["A1"].value = f"Semester {sem_num} — Detailed Results"
+        sheet["A1"].font = Font(bold=True, size=12, color="4F8CFF")
+
+        headers = ["Subject Code", "Subject Name", "Marks", "Max Marks", "Grade", "Status"]
+        for c, h in enumerate(headers, 1):
+            cell = sheet.cell(row=3, column=c, value=h)
+            cell.font = hdr_font
+            cell.fill = dark_fill
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin_border
+
+        for i, r in enumerate(by_sem[sem_num], start=4):
+            status = r.get("pass_status", "—") or "—"
+            vals = [
+                r.get("subject_code", ""),
+                r.get("subject_name", ""),
+                int(r.get("marks_obtained", 0) or 0),
+                int(r.get("max_marks", 100) or 100),
+                r.get("grade", "—") or "—",
+                status,
+            ]
+            for c, v in enumerate(vals, 1):
+                cell = sheet.cell(row=i, column=c, value=v)
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="center") if c >= 3 else Alignment()
+                if status == "FAIL":
+                    cell.font = fail_font
+                elif c == 6 and status == "PASS":
+                    cell.font = pass_font
+                else:
+                    cell.font = value_font
+                if i % 2 == 0:
+                    cell.fill = alt_fill
+
+        for col in sheet.columns:
+            max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+            sheet.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _build_docx_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, sems, results, metrics):
     """Build a DOCX academic report using python-docx."""
     import io
     from datetime import date
     from docx import Document
     from docx.shared import Pt, RGBColor, Inches, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
     ACCENT = RGBColor(0x4f, 0x8c, 0xff)
     DARK   = RGBColor(0x1a, 0x1d, 0x27)
     MUTED  = RGBColor(0x8b, 0x8f, 0xa3)
@@ -669,6 +1271,9 @@ def _build_docx_report(usn, name, email_str, dept, batch_year, cgpa, backlogs, s
     add_field("Department",     dept if dept else "—")
     add_field("Batch Year",     str(batch_year) if batch_year else "—")
     add_field("CGPA",           f"{cgpa:.2f}")
+    add_field("Overall Percentage", f"{metrics['percentage']:.2f}%")
+    add_field("Subjects Passed", f"{metrics['subjects_passed']} / {metrics['subjects_total']}")
+    add_field("Best SGPA", f"{metrics['best_sgpa']:.2f}" if metrics["best_sgpa"] else "â€”")
     add_field("Active Backlogs", str(backlogs))
 
     # Semester Summary
@@ -828,6 +1433,70 @@ def _local_chat_answer(message: str) -> str:
         )
 
 
+def _verify_chat_reply(reply: str, inst_id: str) -> tuple[str, bool]:
+    """
+    Verification agent: extract every USN mentioned in the LLM reply, look up
+    the student's actual DB values, and flag any discrepancies in CGPA or
+    backlog count. Returns (annotated_reply, had_issues).
+    """
+    usns = list(dict.fromkeys(  # deduplicate, preserve order
+        re.findall(r'\b[1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3}\b', reply.upper())
+    ))
+    if not usns:
+        return reply + "\n\n✅ *Verified — no specific student data in this response.*", False
+
+    issues: list[str] = []
+    verified: list[str] = []
+    try:
+        db.init_db()
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                for usn in usns:
+                    cur.execute("""
+                        SELECT s.usn, s.name AS full_name, s.cgpa, s.active_backlogs
+                        FROM students s
+                        WHERE UPPER(s.usn) = %s AND s.institution_id = %s
+                          AND (s.metadata ? 'source')
+                          AND s.metadata->>'source' IN ('pipeline', 'upload')
+                    """, (usn, inst_id))
+                    actual = cur.fetchone()
+                    if not actual:
+                        issues.append(f"⚠ **{usn}** not found in database — this data may be hallucinated.")
+                        continue
+
+                    name = actual.get("full_name") or usn
+                    # Scan the ±100-char window around this USN for floating-point values
+                    idx = reply.upper().find(usn)
+                    snippet = reply[max(0, idx - 80): idx + 140]
+                    floats_nearby = re.findall(r'\b(\d+\.\d{1,2})\b', snippet)
+                    mismatch = False
+                    if actual.get("cgpa") and floats_nearby:
+                        actual_cgpa = float(actual["cgpa"])
+                        for val in floats_nearby:
+                            mentioned = float(val)
+                            if 0.0 < mentioned <= 10.0 and abs(mentioned - actual_cgpa) > 0.15:
+                                issues.append(
+                                    f"⚠ **{usn} ({name})** — reply mentions {mentioned:.2f} "
+                                    f"near this USN but actual CGPA is **{actual_cgpa:.2f}**."
+                                )
+                                mismatch = True
+                                break
+                    if not mismatch:
+                        verified.append(f"✓ {usn} ({name}) — CGPA {float(actual['cgpa']):.2f}" if actual.get("cgpa") else f"✓ {usn} ({name})")
+    except Exception as exc:
+        logger.warning("verification_agent_failed", error=str(exc))
+        return reply, False
+
+    if not issues:
+        note = "✅ *Verification agent: data confirmed for " + ", ".join(verified) + ".*"
+        return reply + "\n\n" + note, False
+
+    block = "\n\n---\n**🔍 Verification Agent:**\n" + "\n".join(issues)
+    if verified:
+        block += "\n" + "\n".join(verified)
+    return reply + block, True
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def ai_chat(req: ChatRequest) -> ChatResponse:
     """AI assistant endpoint — answers teacher questions using Gemini + live DB context."""
@@ -852,8 +1521,11 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
         total_students = stats.get('total_students', 0)
         context_lines.append(f"DATABASE SUMMARY:")
         context_lines.append(f"- Total students: {total_students}")
+        context_lines.append(f"- Students from email pipeline: {stats.get('email_students', 0)}")
+        context_lines.append(f"- Students from admin uploads: {stats.get('admin_students', 0)}")
+        context_lines.append(f"- Email extractions: {stats.get('email_extractions', 0)}")
+        context_lines.append(f"- Admin upload files: {stats.get('admin_upload_files', 0)}")
         context_lines.append(f"- Total result records: {stats.get('total_results', 0)}")
-        context_lines.append(f"- Emails processed: {stats.get('emails_processed', 0)}")
         if stats.get("average_cgpa"):
             context_lines.append(f"- Average CGPA: {stats['average_cgpa']:.2f}")
         if stats.get("total_backlogs") is not None:
@@ -869,10 +1541,10 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
                         SELECT s.usn, s.name AS full_name, s.cgpa, s.active_backlogs
                         FROM students s
                         WHERE s.institution_id = %s
-                          AND (s.metadata->>'source' IS DISTINCT FROM 'seed')
+                                                    {student_filter}
                         ORDER BY s.cgpa DESC NULLS LAST
                         LIMIT 100
-                    """, (inst_id,))
+                                        """.format(student_filter=db.student_source_filter("s", include_and=True)), (inst_id,))
                     all_students = cur.fetchall()
                     if all_students:
                         context_lines.append(f"\nALL STUDENTS ({len(all_students)}):")
@@ -886,9 +1558,9 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
                     SELECT s.usn, s.name AS full_name, s.active_backlogs
                     FROM students s
                     WHERE s.institution_id = %s AND s.active_backlogs > 0
-                      AND (s.metadata->>'source' IS DISTINCT FROM 'seed')
+                                            {student_filter}
                     ORDER BY s.active_backlogs DESC
-                """, (inst_id,))
+                                """.format(student_filter=db.student_source_filter("s", include_and=True)), (inst_id,))
                 backlog_students = cur.fetchall()
                 if backlog_students:
                     context_lines.append(f"\nSTUDENTS WITH BACKLOGS ({len(backlog_students)}):")
@@ -903,11 +1575,11 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
                     FROM student_results sr
                     JOIN subjects sub ON sr.subject_id = sub.id
                     JOIN students s ON sr.student_id = s.id
-                    WHERE (s.metadata->>'source' IS DISTINCT FROM 'seed')
+                    WHERE {student_filter}
                     GROUP BY sub.id, sub.name, sub.code
                     ORDER BY (SUM(CASE WHEN sr.status='PASS' THEN 1 ELSE 0 END)::float / COUNT(*)) ASC
                     LIMIT 5
-                """, ())
+                """.format(student_filter=db.student_source_filter("s")), ())
                 hard_subjects = cur.fetchall()
                 if hard_subjects:
                     context_lines.append("\nSUBJECTS WITH LOWEST PASS RATE:")
@@ -917,44 +1589,37 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
 
                 # Specific student detail if USN or name found in question OR in history
                 usn_match = re.search(r'\b[1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3}\b', req.message.upper())
-                # Also try name-based lookup if no USN matched
+
+                # Name-based lookup via search_students (handles all-caps names, single words)
                 name_match_usn = None
                 if not usn_match:
-                    # Extract 2+ consecutive capitalized words as potential name
-                    name_candidates = re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+', req.message.title())
-                    for candidate in name_candidates:
-                        cur.execute("""
-                            SELECT usn FROM students
-                            WHERE LOWER(name) LIKE LOWER(%s)
-                              AND (metadata->>'source' IS DISTINCT FROM 'seed')
-                            LIMIT 1
-                        """, (f'%{candidate}%',))
-                        row = cur.fetchone()
-                        if row:
-                            name_match_usn = row[0] if isinstance(row, (list, tuple)) else row['usn']
+                    significant = [
+                        w.strip('.,!?;:()"\'') for w in req.message.split()
+                        if len(w.strip('.,!?;:()"\'')) >= 4
+                    ]
+                    for word in significant:
+                        hits = db.search_students(word, institution_id=inst_id, limit=1)
+                        if hits:
+                            name_match_usn = hits[0]["usn"]
                             break
 
-                # Fall back: scan recent history for a USN (handles follow-up questions)
+                # Scan recent history for USN or name (handles follow-up questions)
                 if not usn_match and not name_match_usn:
                     for hist_msg in reversed(req.history[-6:]):
                         hist_usn = re.search(r'\b[1-4][A-Z]{2}\d{2}[A-Z]{2,4}\d{3}\b', hist_msg.content.upper())
                         if hist_usn:
                             name_match_usn = hist_usn.group(0)
                             break
-                    # Also scan history for names if still not found
                     if not name_match_usn:
                         for hist_msg in reversed(req.history[-6:]):
-                            name_candidates = re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+', hist_msg.content.title())
-                            for candidate in name_candidates:
-                                cur.execute("""
-                                    SELECT usn FROM students
-                                    WHERE LOWER(name) LIKE LOWER(%s)
-                                      AND (metadata->>'source' IS DISTINCT FROM 'seed')
-                                    LIMIT 1
-                                """, (f'%{candidate}%',))
-                                row = cur.fetchone()
-                                if row:
-                                    name_match_usn = row[0] if isinstance(row, (list, tuple)) else row['usn']
+                            hist_words = [
+                                w.strip('.,!?;:()"\'') for w in hist_msg.content.split()
+                                if len(w.strip('.,!?;:()"\'')) >= 4
+                            ]
+                            for word in hist_words:
+                                hits = db.search_students(word, institution_id=inst_id, limit=1)
+                                if hits:
+                                    name_match_usn = hits[0]["usn"]
                                     break
                             if name_match_usn:
                                 break
@@ -969,8 +1634,11 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
                     usn = target_usn.upper()
                     cur.execute("""
                         SELECT s.usn, s.name AS full_name, s.cgpa, s.active_backlogs
-                        FROM students s WHERE UPPER(s.usn) = %s
-                    """, (usn,))
+                        FROM students s
+                        WHERE UPPER(s.usn) = %s
+                          AND s.institution_id = %s
+                          {sf}
+                    """.format(sf=db.student_source_filter("s", include_and=True)), (usn, inst_id))
                     st = cur.fetchone()
                     if st:
                         context_lines.append(f"\nSTUDENT DETAIL for {usn}:")
@@ -1019,46 +1687,75 @@ async def ai_chat(req: ChatRequest) -> ChatResponse:
         + f"Teacher: {req.message}\nAcadAssist:"
     )
 
-    provider = settings.llm.active_provider
+    # Build waterfall from all configured providers: groq → openai → gemini
+    _chat_providers: list[str] = []
+    if settings.llm.groq_api_key:
+        _chat_providers.append("groq")
+    if settings.llm.primary_api_key:
+        _chat_providers.append("openai")
+    if settings.llm.secondary_api_key:
+        _chat_providers.append("gemini")
+
+    reply: str | None = None
+    _last_exc: Exception | None = None
+
+    for _provider in _chat_providers:
+        try:
+            if _provider == "groq":
+                from groq import Groq
+                gclient = Groq(api_key=settings.llm.groq_api_key)
+                completion = gclient.chat.completions.create(
+                    model=settings.llm.groq_model,
+                    messages=[{"role": "user", "content": full_prompt}],
+                    temperature=0.3,
+                    max_tokens=1024,
+                )
+                reply = completion.choices[0].message.content.strip()
+            elif _provider == "openai":
+                from openai import AsyncOpenAI
+                oclient = AsyncOpenAI(api_key=settings.llm.primary_api_key)
+                resp = await oclient.chat.completions.create(
+                    model=settings.llm.primary_model,
+                    messages=[{"role": "user", "content": full_prompt}],
+                    temperature=0.3,
+                    max_tokens=1024,
+                )
+                reply = resp.choices[0].message.content.strip()
+            elif _provider == "gemini":
+                import google.generativeai as genai
+                genai.configure(api_key=settings.llm.secondary_api_key)
+                gmodel = genai.GenerativeModel(settings.llm.secondary_model)
+                response = await gmodel.generate_content_async(
+                    full_prompt,
+                    generation_config={"temperature": 0.3, "max_output_tokens": 1024},
+                )
+                reply = response.text.strip()
+            if reply:
+                logger.debug("ai_chat: provider=%s succeeded", _provider)
+                break
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("ai_chat_%s_failed: %s", _provider, exc)
+            _last_exc = exc
+
+    if not reply:
+        # All providers exhausted — give a user-friendly error
+        _msg = str(_last_exc) if _last_exc else "unknown"
+        if _last_exc and "rate_limit" in _msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="AI provider rate limit reached. Please try again in a few minutes.",
+            )
+        raise HTTPException(
+            status_code=503,
+            detail="AI assistant is temporarily unavailable. Please try again shortly.",
+        )
+
+    # Run verification agent to cross-check the LLM reply against live DB values
     try:
-        if provider == "groq":
-            from groq import Groq
-            gclient = Groq(api_key=settings.llm.groq_api_key)
-            completion = gclient.chat.completions.create(
-                model=settings.llm.groq_model,
-                messages=[{"role": "user", "content": full_prompt}],
-                temperature=0.3,
-                max_tokens=1024,
-            )
-            reply = completion.choices[0].message.content.strip()
-        elif provider == "gemini":
-            import google.generativeai as genai
-            genai.configure(api_key=settings.llm.secondary_api_key)
-            gmodel = genai.GenerativeModel(settings.llm.secondary_model)
-            response = await gmodel.generate_content_async(
-                full_prompt,
-                generation_config={"temperature": 0.3, "max_output_tokens": 1024},
-            )
-            reply = response.text.strip()
-        elif provider == "openai":
-            from openai import AsyncOpenAI
-            oclient = AsyncOpenAI(api_key=settings.llm.primary_api_key)
-            resp = await oclient.chat.completions.create(
-                model=settings.llm.primary_model,
-                messages=[{"role": "user", "content": full_prompt}],
-                temperature=0.3,
-                max_tokens=1024,
-            )
-            reply = resp.choices[0].message.content.strip()
-        else:
-            # provider is "none" but we got past the no_llm check — shouldn't happen,
-            # but gracefully fall back to the local DB query engine
-            reply = _local_chat_answer(req.message)
-            return ChatResponse(reply=reply, context_used=bool(context_lines))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("ai_chat_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=f"AI assistant error: {str(e)}")
+        reply, _ = _verify_chat_reply(reply, _get_institution_id())
+    except Exception as exc:
+        logger.warning("verification_agent_skipped", error=str(exc))
 
     return ChatResponse(reply=reply, context_used=context_used)

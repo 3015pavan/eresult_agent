@@ -3,6 +3,8 @@ FastAPI Application Factory.
 
 Creates and configures the production FastAPI application with:
   - CORS, request validation
+  - SlowAPI rate limiting (Redis-backed, 200 req/min per IP)
+  - Sentry error tracking
   - Structured logging middleware
   - Prometheus metrics endpoint
   - Health check endpoints
@@ -24,27 +26,50 @@ try:
 except ImportError:
     pass  # python-dotenv not installed — rely on shell environment
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.common.config import get_settings
 from src.common.observability import get_logger
+from src.common.security import require_operator_access
 
 FRONTEND_DIR = pathlib.Path(__file__).resolve().parent.parent / "frontend"
 
 logger = get_logger(__name__)
+
+# ── Rate limiter (SlowAPI + Redis, graceful fallback to in-memory) ─────────────
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
+    _SLOWAPI_AVAILABLE = True
+except ImportError:
+    limiter = None
+    _SLOWAPI_AVAILABLE = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifecycle: startup and shutdown."""
     settings = get_settings()
-    logger.info(
-        "application_starting",
-        environment=settings.environment,
-    )
+    logger.info("application_starting", environment=settings.environment)
+
+    # ── Sentry error tracking ────────────────────────────────────────────────
+    if settings.sentry_dsn:
+        try:
+            import sentry_sdk
+            sentry_sdk.init(
+                dsn=settings.sentry_dsn,
+                environment=settings.environment,
+                traces_sample_rate=0.1,
+                send_default_pii=False,
+            )
+            logger.info("sentry_ready")
+        except Exception as exc:
+            logger.warning("sentry_init_failed", error=str(exc))
 
     # ── PostgreSQL ───────────────────────────────────────────────────────────
     try:
@@ -102,7 +127,18 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if settings.environment != "production" else None,
     )
 
-    # CORS
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    if _SLOWAPI_AVAILABLE:
+        app.state.limiter = limiter
+        app.add_exception_handler(
+            RateLimitExceeded,
+            lambda req, exc: JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Max 200 requests/minute per IP."},
+            ),
+        )
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.security.allowed_origins,
@@ -111,18 +147,20 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Register routers
-    from src.api.routes import query, admin, health, auth, webhook, accounts, sync, pipeline
+    # ── Register routers ──────────────────────────────────────────────────────
+    from src.api.routes import query, admin, health, auth, webhook, accounts, sync, pipeline, health_simple
     from src.api.routes.agent import router as agent_router
+    protected = [Depends(require_operator_access)]
     app.include_router(health.router, tags=["Health"])
+    app.include_router(health_simple.router, tags=["SimpleHealth"])
     app.include_router(auth.router, prefix="/api/v1", tags=["Auth"])
     app.include_router(query.router, prefix="/api/v1", tags=["Query"])
-    app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
+    app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"], dependencies=protected)
     app.include_router(webhook.router, prefix="/webhooks", tags=["Webhooks"])
-    app.include_router(accounts.router, prefix="/api/v1/accounts", tags=["Accounts"])
-    app.include_router(sync.router, prefix="/api/v1", tags=["Sync"])
-    app.include_router(pipeline.router, prefix="/api/v1", tags=["Pipeline"])
-    app.include_router(agent_router, prefix="/api/v1/agent", tags=["Agent"])
+    app.include_router(accounts.router, prefix="/api/v1/accounts", tags=["Accounts"], dependencies=protected)
+    app.include_router(sync.router, prefix="/api/v1", tags=["Sync"], dependencies=protected)
+    app.include_router(pipeline.router, prefix="/api/v1", tags=["Pipeline"], dependencies=protected)
+    app.include_router(agent_router, prefix="/api/v1/agent", tags=["Agent"], dependencies=protected)
 
     # Serve frontend static assets (CSS, JS)
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR / "static")), name="static")

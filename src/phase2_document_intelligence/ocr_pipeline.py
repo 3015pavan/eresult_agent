@@ -16,9 +16,9 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import Optional
 
 from .router import ParsedDocument
+from .table_detector import detect_table_regions
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +90,54 @@ def _ocr_image(image_path: str) -> tuple[str, str]:
         text = _ocr_with_paddle(image_path)
         return text, "paddleocr"
     except Exception as pe:
-        logger.debug("PaddleOCR unavailable (%s), trying Tesseract", pe)
+        logger.error(f"PaddleOCR failed: {pe}. Trying Tesseract.")
 
     try:
         text = _ocr_with_tesseract(image_path)
         return text, "tesseract"
     except Exception as te:
-        logger.warning("Tesseract unavailable: %s", te)
+        logger.error(f"Tesseract OCR failed: {te}")
 
+    logger.error(f"OCR failed for image: {image_path}")
     return "", "ocr_failed"
+
+
+def _ocr_detected_regions(image_path: str) -> tuple[str, str]:
+    """
+    Use YOLOv8-detected table regions when available, falling back to the whole
+    page if detection is unavailable.
+    """
+    try:
+        from PIL import Image  # type: ignore
+
+        regions = detect_table_regions(image_path)
+        if not regions:
+            return _ocr_image(image_path)
+
+        img = Image.open(image_path)
+        texts: list[str] = []
+        strategies: set[str] = set()
+        for i, region in enumerate(regions):
+            crop = img.crop((region["x1"], region["y1"], region["x2"], region["y2"]))
+            with tempfile.NamedTemporaryFile(suffix=f"_table_{i}.png", delete=False) as tmp:
+                crop.save(tmp.name)
+                crop_path = tmp.name
+            try:
+                text, strat = _ocr_image(crop_path)
+                if text:
+                    texts.append(text)
+                strategies.add(strat)
+            finally:
+                try:
+                    os.unlink(crop_path)
+                except OSError:
+                    pass
+        if texts:
+            label = "+".join(sorted(strategies)) if strategies else "ocr"
+            return "\n\n".join(texts), f"yolo_regions_{label}"
+    except Exception as exc:
+        logger.debug("yolo_region_ocr_failed: %s", exc)
+    return _ocr_image(image_path)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -123,7 +162,7 @@ def parse_pdf_scanned(path: str) -> ParsedDocument:
 
     try:
         for img_path in image_paths:
-            text, strat = _ocr_image(img_path)
+            text, strat = _ocr_detected_regions(img_path)
             strategy = strat
             if text:
                 all_text.append(text)
@@ -152,7 +191,7 @@ def parse_pdf_scanned(path: str) -> ParsedDocument:
 def parse_image(path: str) -> ParsedDocument:
     """Extract text from a standalone image file (PNG, JPG, TIFF)."""
     mime = f"image/{os.path.splitext(path)[1].lstrip('.').lower()}"
-    text, strategy = _ocr_image(path)
+    text, strategy = _ocr_detected_regions(path)
     return ParsedDocument(
         source_path=path,
         mime_type=mime,

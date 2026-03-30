@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 from .router import ParsedDocument
 
@@ -118,12 +117,19 @@ def parse_html(
 
             text   = _extract_text_bs4(soup)
             tables = _parse_tables_bs4(BeautifulSoup(html_content, "html.parser"))
+            # Per-cell confidence scores
+            try:
+                from src.phase2_document_intelligence.excel_parser import _compute_cell_confidences
+                cell_confidences = _compute_cell_confidences(tables)
+            except Exception:
+                cell_confidences = []
             # Re-parse without modifications for table extraction
             return ParsedDocument(
                 source_path=source_path,
                 mime_type="text/html",
                 text=text,
                 tables=tables,
+                cell_confidences=cell_confidences,
                 parse_strategy="beautifulsoup",
                 confidence=0.85 if text else 0.3,
             )

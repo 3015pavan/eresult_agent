@@ -28,7 +28,7 @@ router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 CREDENTIALS_FILE   = PROJECT_ROOT / "config" / "secrets" / "credentials.json"
 TOKEN_FILE         = PROJECT_ROOT / "config" / "secrets" / "token.json"
-CODE_VERIFIER_FILE = PROJECT_ROOT / "data" / "state" / ".oauth_verifier"  # temp PKCE store
+CODE_VERIFIER_FILE = PROJECT_ROOT / "data" / "state" / "oauth_verifier.txt"  # temp PKCE store
 
 # Gmail scopes: read-only email + profile info
 SCOPES = [
@@ -41,7 +41,17 @@ SCOPES = [
 
 def _get_redirect_uri() -> str:
     """Return the OAuth redirect URI pointing back to our callback."""
-    return "http://localhost:8000/api/v1/auth/callback"
+    import os
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(PROJECT_ROOT / ".env", override=False)
+    except Exception:
+        pass
+    explicit = (os.getenv("GMAIL_REDIRECT_URI") or "").strip()
+    if explicit:
+        return explicit
+    port = os.getenv("APP_PORT", "8002")
+    return f"http://localhost:{port}/api/v1/auth/callback"
 
 
 def _load_credentials() -> Credentials | None:

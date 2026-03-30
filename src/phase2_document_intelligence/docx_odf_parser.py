@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Optional
 
 from .router import ParsedDocument
 
@@ -185,11 +184,18 @@ def parse_document_file(path: str, mime_type: str = "") -> ParsedDocument:
     if not confidence and errors:
         confidence = 0.0
 
+    try:
+        from src.phase2_document_intelligence.excel_parser import _compute_cell_confidences
+        cell_confidences = _compute_cell_confidences(tables)
+    except Exception:
+        cell_confidences = []
+
     return ParsedDocument(
         source_path=path,
         mime_type=mime_type or f"application/{ext}",
         text=text,
         tables=tables,
+        cell_confidences=cell_confidences,
         parse_strategy=strategy,
         confidence=confidence,
         errors=errors,

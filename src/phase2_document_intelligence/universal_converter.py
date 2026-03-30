@@ -33,15 +33,41 @@ from .router import ParsedDocument
 
 logger = logging.getLogger(__name__)
 
-_VISION_PROMPT = """You are an academic result OCR engine.
-Extract ALL text visible in this image exactly as it appears.
-If it is a mark sheet / result card, preserve:
-- Student name, USN/Registration number
-- Semester number, academic year
-- Subject codes, subject names, marks, grades, PASS/FAIL status
-- SGPA, CGPA values
+_VISION_PROMPT = """You are a specialist academic-document OCR engine trained on VTU/MSRIT grade reports.
+Extract ALL student result data from this image with exact fidelity.
 
-Return only the extracted text, no commentary."""
+DOCUMENT ANALYSIS STEPS:
+1. Identify layout: single-column, multi-column, wide-format grade table, or scanned document.
+2. Detect header region: institution name, semester, branch, academic year, exam type.
+3. Locate the student data table — it may span the full page width with many subjects as columns.
+4. For wide-format VTU reports: Row structure is typically:
+   Sl. No. | USN | Student Name | [Subject1 marks] | [Subject1 grade] | [Subject2 marks] | ...
+5. For each student row, expand to ONE ROW PER SUBJECT in the output table.
+
+OUTPUT FORMAT — return two sections separated by "---TABLE---":
+
+SECTION 1 (document metadata + raw text):
+Transcribe every visible line exactly as printed.
+Include: institution name, semester, branch, academic year, exam type, all student rows.
+
+---TABLE---
+
+SECTION 2 (normalized table — ONE ROW PER STUDENT PER SUBJECT):
+First row must be the header. Use pipe-separated values.
+Header: USN | Student Name | Semester | Subject Code | Subject Name | Internal | External | Total | Max Marks | Grade | Grade Points | Status | SGPA | CGPA | confidence
+Rules:
+- confidence: 0.97 if value clearly legible, 0.80 if partially obscured, 0.50 if guessed
+- Status: PASS or FAIL (infer from marks if not printed explicitly)
+- Leave unknown fields empty (do NOT invent values)
+- SGPA/CGPA: copy from the student row if printed; leave empty otherwise
+
+Example row:
+1MS21CS001 | John Doe | 5 | 21CS51 | Data Structures | 22 | 56 | 78 | 100 | A | 9 | PASS | 8.50 | 8.20 | 0.97
+
+If no table is present, leave SECTION 2 empty.
+Return only the two sections above — no commentary."""
+
+_TABLE_SEPARATOR = "---TABLE---"
 
 
 def _groq_key() -> str:
@@ -58,8 +84,8 @@ def _ocr_with_vision_llm(image_bytes: bytes, mime_type: str = "image/jpeg") -> s
     """
     import httpx
     b64 = base64.b64encode(image_bytes).decode()
-    # Use llama-4-scout for vision (llama-3.2-vision was decommissioned)
-    vision_model = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    # Configurable vision model: override with GROQ_VISION_MODEL env var
+    vision_model = os.getenv("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
     payload = {
         "model": vision_model,
         "messages": [
@@ -120,26 +146,86 @@ def _ocr_with_pil_preprocess_tesseract(image_bytes: bytes) -> str:
             pass
 
 
-def ocr_image_bytes(image_bytes: bytes, mime_type: str = "image/jpeg") -> tuple[str, str]:
+def _parse_vlm_table_section(
+    table_text: str,
+) -> tuple[list[list[str]], list[list[float]]]:
     """
-    OCR image bytes to text. Returns (text, strategy).
+    Parse the pipe-separated table from VLM structured output.
+    The last column may be a 'confidence' float (0.0–1.0).
+
+    Returns:
+        (rows, row_confidences) where rows have the confidence column stripped
+        and row_confidences[i] is the per-row confidence (broadcast to all cells).
+    """
+    rows: list[list[str]] = []
+    row_confidences: list[list[float]] = []
+    header_seen = False
+
+    for line in table_text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 2 or not any(cells):
+            continue
+
+        # Try to extract trailing confidence column
+        conf: float = 1.0
+        last = cells[-1]
+        try:
+            candidate = float(last)
+            if 0.0 <= candidate <= 1.0:
+                conf = candidate
+                cells = cells[:-1]
+        except (ValueError, TypeError):
+            pass
+
+        # Skip header row from confidence tracking
+        if not header_seen:
+            header_seen = True
+            rows.append(cells)
+            row_confidences.append([1.0] * len(cells))
+        else:
+            rows.append(cells)
+            row_confidences.append([conf] * len(cells))
+
+    return rows, row_confidences
+
+
+def ocr_image_bytes(
+    image_bytes: bytes, mime_type: str = "image/jpeg"
+) -> tuple[str, list[list[list[str]]], str, list[list[list[float]]]]:
+    """
+    OCR image bytes to text + structured tables + cell confidences.
+    Returns (text, tables, strategy, cell_confidences).
     Tries Vision LLM → PIL+Tesseract.
     """
     if _groq_key():
         try:
-            text = _ocr_with_vision_llm(image_bytes, mime_type)
-            if text and len(text) > 20:
-                return text, "groq_vision"
+            raw = _ocr_with_vision_llm(image_bytes, mime_type)
+            if raw and len(raw) > 20:
+                # Split on table separator
+                if _TABLE_SEPARATOR in raw:
+                    parts = raw.split(_TABLE_SEPARATOR, 1)
+                    text_part = parts[0].strip()
+                    table_rows, row_confs = _parse_vlm_table_section(parts[1])
+                    tables = [table_rows] if table_rows else []
+                    cell_confidences = [row_confs] if table_rows else []
+                else:
+                    text_part = raw.strip()
+                    tables = []
+                    cell_confidences = []
+                return text_part, tables, "groq_vision", cell_confidences
         except Exception as exc:
             logger.warning("vision_llm_ocr failed: %s", exc)
 
     try:
         text = _ocr_with_pil_preprocess_tesseract(image_bytes)
-        return text, "pil_tesseract"
+        return text, [], "pil_tesseract", []
     except Exception as exc:
         logger.warning("pil_tesseract_ocr failed: %s", exc)
 
-    return "", "ocr_failed"
+    return "", [], "ocr_failed", []
 
 
 def ocr_image_path(path: str) -> ParsedDocument:
@@ -148,7 +234,7 @@ def ocr_image_path(path: str) -> ParsedDocument:
     try:
         with open(path, "rb") as f:
             image_bytes = f.read()
-        text, strategy = ocr_image_bytes(image_bytes, mime)
+        text, tables, strategy, cell_confidences = ocr_image_bytes(image_bytes, mime)
     except Exception as exc:
         return ParsedDocument(
             source_path=path,
@@ -161,6 +247,8 @@ def ocr_image_path(path: str) -> ParsedDocument:
         source_path=path,
         mime_type=mime,
         text=text,
+        tables=tables,
+        cell_confidences=cell_confidences,
         parse_strategy=f"image_{strategy}",
         confidence=0.80 if strategy == "groq_vision" and text else 0.60 if text else 0.0,
         errors=["no_text_extracted"] if not text else [],
@@ -236,11 +324,13 @@ def convert_bytes(
 
     # ── Images: use Vision LLM OCR ────────────────────────────────────────────
     if mime_type.startswith("image/") or ext in ("jpg", "jpeg", "png", "tiff", "bmp", "webp", "gif"):
-        text, strategy = ocr_image_bytes(data, mime_type or f"image/{ext or 'jpeg'}")
+        text, tables, strategy, cell_confidences = ocr_image_bytes(data, mime_type or f"image/{ext or 'jpeg'}")
         return ParsedDocument(
             source_path=source_hint or filename,
             mime_type=mime_type,
             text=text,
+            tables=tables,
+            cell_confidences=cell_confidences,
             parse_strategy=f"image_{strategy}",
             confidence=0.80 if strategy == "groq_vision" and text else 0.60 if text else 0.0,
             errors=["no_text_extracted"] if not text else [],

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 from .router import ParsedDocument
 from .table_stitcher import stitch_tables
@@ -30,6 +29,18 @@ def parse_pdf_native(path: str) -> ParsedDocument:
     strategy = "pdfplumber"
     confidence = 0.75
     errors: list[str] = []
+
+    # Optional structured digital PDF parser
+    try:
+        from .llamaparse_adapter import parse_pdf_with_llamaparse
+
+        llama_doc = parse_pdf_with_llamaparse(path)
+        if llama_doc and llama_doc.text:
+            text_parts.append(llama_doc.text)
+            strategy = llama_doc.parse_strategy
+            confidence = max(confidence, llama_doc.confidence)
+    except Exception as exc:
+        errors.append(f"llamaparse:{exc}")
 
     # ── 1. pdfplumber for raw text ────────────────────────────────────────────
     try:
@@ -102,11 +113,25 @@ def parse_pdf_native(path: str) -> ParsedDocument:
     if len(all_tables) > 1:
         all_tables = stitch_tables(all_tables)
 
+    # ── 5. Compute per-cell confidence ────────────────────────────────────────
+    # Import heuristic cell-confidence scorer from excel_parser (same logic)
+    try:
+        from src.phase2_document_intelligence.excel_parser import _compute_cell_confidences
+        cell_confidences = _compute_cell_confidences(all_tables)
+        # Scale by strategy confidence so PDF OCR cells score lower than native
+        cell_confidences = [
+            [[v * confidence for v in row] for row in tbl]
+            for tbl in cell_confidences
+        ]
+    except Exception:
+        cell_confidences = []
+
     return ParsedDocument(
         source_path=path,
         mime_type="application/pdf",
         text="\n\n".join(text_parts),
         tables=all_tables,
+        cell_confidences=cell_confidences,
         parse_strategy=strategy,
         confidence=confidence,
         errors=errors,

@@ -34,7 +34,7 @@ def _get_result_backend() -> str:
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = Celery(
+celery_app = Celery(
     "acadextract",
     broker=_get_broker_url(),
     backend=_get_result_backend(),
@@ -42,11 +42,13 @@ app = Celery(
         "src.tasks.ingestion",
         "src.tasks.extraction",
         "src.tasks.indexing",
+        "src.tasks.imap_sync",
+        "src.tasks.pipeline_runner",
     ],
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-app.conf.update(
+celery_app.conf.update(
     # Serialisation
     task_serializer="json",
     accept_content=["json"],
@@ -67,6 +69,7 @@ app.conf.update(
     # Route tasks to correct queues
     task_routes={
         "src.tasks.ingestion.*":  {"queue": "email_ingestion"},
+        "src.tasks.imap_sync.*":  {"queue": "email_ingestion"},
         "src.tasks.extraction.*": {"queue": "extraction"},
         "src.tasks.indexing.*":   {"queue": "indexing"},
     },
@@ -82,16 +85,22 @@ app.conf.update(
 )
 
 # ── Periodic tasks (Beat scheduler) ──────────────────────────────────────────
-app.conf.beat_schedule = {
+celery_app.conf.beat_schedule = {
     # Auto-sync Gmail every 15 minutes
     "sync-gmail-every-15m": {
-        "task":     "src.tasks.ingestion.sync_gmail",
+        "task":     "src.tasks.ingestion.sync_gmail_inbox",
         "schedule": crontab(minute="*/15"),
+        "options":  {"queue": "email_ingestion"},
+    },
+    # Auto-sync IMAP accounts every 10 minutes
+    "sync-imap-every-10m": {
+        "task":     "src.tasks.imap_sync.sync_imap_accounts",
+        "schedule": crontab(minute="*/10"),
         "options":  {"queue": "email_ingestion"},
     },
     # Rebuild pgvector embeddings nightly
     "rebuild-embeddings-nightly": {
-        "task":     "src.tasks.indexing.rebuild_embeddings",
+        "task":     "src.tasks.indexing.rebuild_all_embeddings",
         "schedule": crontab(hour=2, minute=0),
         "options":  {"queue": "indexing"},
     },
